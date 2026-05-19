@@ -17,6 +17,8 @@ import { useRequireAuth } from "@/lib/useAuth";
 import { WorkspaceInfoModal } from '@/components/workspace/WorkspaceInfoModal';
 import { markChannelRead, markDMRead, markProjectChatRead, getChannelUnreadCount, getDMUnreadCount } from "@/utils/reads";
 import { trackProjectAccess, getRecentProjects, getProjectUnreadCount } from "@/utils/projectAccess";
+import AuthGuard from "@/components/AuthGuard";
+import { goToCentralLogout } from "@/lib/centralAuth";
 
 // ─── Types ───────────────────────────────────────────────
 type Profile = {
@@ -500,6 +502,7 @@ function WorkspacePage() {
 
   const [activeProject, setActiveProject] = useState<Project | null>(null);
   const [projectMembers, setProjectMembers] = useState<ProjectMember[]>([]);
+
   const [loadingProjects, setLoadingProjects] = useState(false);
 
   // Create project modal
@@ -916,20 +919,51 @@ function WorkspacePage() {
   };
 
   // Load all projects for this workspace
-  const loadProjects = async (userId?: string) => {
-    const uid = userId ?? me?.id;
+  const loadProjects = async (currentUserId?: string) => {
+    const uid = currentUserId ?? me?.id;
     if (!uid) return;
+
     setLoadingProjects(true);
-    const { data } = await supabase
+
+    const { data: allProjects } = await supabase
       .from("projects")
       .select("*")
       .eq("workspace_id", workspaceId)
       .order("created_at");
-    setProjects(data ?? []);
 
-    // Load recent projects from DB
+    if (!allProjects?.length) {
+      setProjects([]);
+      setRecentProjectIds([]);
+      setLoadingProjects(false);
+      return;
+    }
+
+    const privateProjects = allProjects.filter((p) => p.is_private);
+    const publicProjects = allProjects.filter((p) => !p.is_private);
+
+    let allowedPrivateIds = new Set<string>();
+
+    if (privateProjects.length > 0) {
+      const { data: memberships } = await supabase
+        .from("project_members")
+        .select("project_id")
+        .eq("user_id", uid)
+        .in("project_id", privateProjects.map((p) => p.id));
+
+      allowedPrivateIds = new Set((memberships ?? []).map((m: any) => m.project_id));
+    }
+
+    const visibleProjects = [
+      ...publicProjects,
+      ...privateProjects.filter((p) => allowedPrivateIds.has(p.id)),
+    ];
+
+    setProjects(visibleProjects);
+
     const recent = await getRecentProjects(uid, workspaceId, 10);
-    setRecentProjectIds(recent.map((p: any) => p.id));
+    setRecentProjectIds(
+      recent.map((p: any) => p.id).filter((id: string) => visibleProjects.some((p) => p.id === id))
+    );
 
     setLoadingProjects(false);
   };
@@ -989,7 +1023,7 @@ function WorkspacePage() {
           setProjects(prev => prev.filter(p => p.id !== deletedId));
           if (activeProject?.id === deletedId) {
             setActiveProject(null);
-            setView('channel' as any);
+            setView('channel');
           }
         }
       )
@@ -1004,7 +1038,11 @@ function WorkspacePage() {
       .from("project_members")
       .select("*")
       .eq("project_id", projectId);
-    if (!pms) return;
+    if (!pms) {
+      setProjectMembers([]);
+      setNonProjectMembers(members);
+      return;
+    }
     const withProfiles = await Promise.all(
       pms.map(async (pm: any) => {
         const { data: p } = await supabase.from("users").select("*").eq("id", pm.user_id).single();
@@ -1025,31 +1063,48 @@ function WorkspacePage() {
   const [allProjectsTab, setAllProjectsTab] = useState<'recent' | 'all'>('recent');
   const PROJECTS_PER_PAGE = 10;
 
-  const openProject = async (project: Project, tab: ProjectTab = 'overview') => {
-    if (activeProject && activeProject.id === project.id && view === 'project') {
+  const openProject = async (project: Project, tab: ProjectTab = "overview") => {
+    if (!me) return;
+
+    if (project.is_private) {
+      const { data: membership } = await supabase
+        .from("project_members")
+        .select("id, role")
+        .eq("project_id", project.id)
+        .eq("user_id", me.id)
+        .single();
+
+      if (!membership) {
+        showToast("You do not have access to this private project.", "error");
+        return;
+      }
+    }
+
+    if (activeProject && activeProject.id === project.id && view === "project") {
       switchProjectTab(tab);
       return;
     }
 
     setActiveProject(project);
-    setView('project');
+    setView("project");
     setActiveChannel(null);
     setActiveDmUserId(null);
     setActiveDmUser(null);
     switchProjectTab(tab);
 
-    // Update recent projects list
-    setRecentProjectIds(prev => {
-      const next = [project.id, ...prev.filter(id => id !== project.id)].slice(0, 10);
+    setRecentProjectIds((prev) => {
+      const next = [project.id, ...prev.filter((id) => id !== project.id)].slice(0, 10);
       return next;
     });
-    if (me?.id) {
+
+    if (me.id) {
       trackProjectAccess(project.id, me.id, workspaceId);
     }
 
     const url = `/workspace/${workspaceId}?project=${project.id}`;
     router.replace(url, { scroll: false });
     localStorage.setItem(`trexaflow_last_${workspaceId}`, url);
+
     setProjectMessages([]);
     await loadProjectMembers(project.id);
     await loadProjectMessages(project.id);
@@ -1062,6 +1117,11 @@ function WorkspacePage() {
 
   // Create project (now with is_private + DB trigger handles member auto-add)
   const createProject = async () => {
+    if (!isWorkspaceAdmin) {
+      showToast("Only workspace admins can create projects.", "error");
+      return;
+    }
+
     if (!newProjectName.trim() || !me || creatingProject || isCreatingProjectRef.current) return;
     setCreatingProject(true);
     isCreatingProjectRef.current = true;
@@ -1109,7 +1169,12 @@ function WorkspacePage() {
 
   // Save project settings edits
   const saveProjectEdit = async () => {
-    if (!activeProject || !editProjectName.trim()) return;
+    if (!activeProject || !editProjectName.trim() || !canManageProject) {
+      if (!canManageProject) {
+        showToast("You do not have permission to edit this project.", "error");
+      }
+      return;
+    }
     setSavingProject(true);
     const { data: updated } = await supabase
       .from("projects")
@@ -1132,7 +1197,12 @@ function WorkspacePage() {
 
   // Delete project
   const deleteProject = async () => {
-    if (!activeProject) return;
+    if (!activeProject || !canManageProject) {
+      if (!canManageProject) {
+        showToast("You do not have permission to delete this project.", "error");
+      }
+      return;
+    }
     await supabase.from("projects").delete().eq("id", activeProject.id);
     setProjects(prev => prev.filter(p => p.id !== activeProject.id));
     setActiveProject(null);
@@ -1145,33 +1215,97 @@ function WorkspacePage() {
   };
 
   // Add member to project
-  const addProjectMember = async (userId: string) => {
-    if (!activeProject) return;
-    await supabase.from("project_members").insert({ project_id: activeProject.id, user_id: userId, role: "member" });
+  const addProjectMember = async (targetUserId: string) => {
+    if (!activeProject || !canManageProject) {
+      showToast("You do not have permission to add project members.", "error");
+      return;
+    }
+
+    const exists = projectMembers.find((pm) => pm.user_id === targetUserId);
+    if (exists) return;
+
+    const { error } = await supabase.from("project_members").insert({
+      project_id: activeProject.id,
+      user_id: targetUserId,
+      role: "member",
+    });
+
+    if (error) {
+      showToast("Failed to add member to project.", "error");
+      return;
+    }
+
     await loadProjectMembers(activeProject.id);
+    showToast("Member added to project.", "success");
   };
 
   // Remove member from project
-  const removeProjectMember = async (userId: string) => {
-    if (!activeProject) return;
-    await supabase.from("project_members").delete().eq("project_id", activeProject.id).eq("user_id", userId);
+  const removeProjectMember = async (targetUserId: string) => {
+    if (!activeProject || !canManageProject) {
+      showToast("You do not have permission to remove project members.", "error");
+      return;
+    }
+
+    if (targetUserId === activeProject.created_by) {
+      showToast("Project creator cannot be removed from the project.", "error");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("project_members")
+      .delete()
+      .eq("project_id", activeProject.id)
+      .eq("user_id", targetUserId);
+
+    if (error) {
+      showToast("Failed to remove member from project.", "error");
+      return;
+    }
+
     await loadProjectMembers(activeProject.id);
+    showToast("Member removed from project.", "success");
   };
 
 
 
   const loadProjectMessages = async (projectId: string) => {
+    if (!me) return;
+
+    const project = activeProject?.id === projectId
+      ? activeProject
+      : projects.find((p) => p.id === projectId);
+
+    if (project?.is_private) {
+      const { data: membership } = await supabase
+        .from("project_members")
+        .select("id")
+        .eq("project_id", projectId)
+        .eq("user_id", me.id)
+        .single();
+
+      if (!membership) {
+        setProjectMessages([]);
+        showToast("You do not have access to this private project chat.", "error");
+        return;
+      }
+    }
+
     setProjectMsgLoading(true);
+
     const { data } = await supabase
-      .from('project_messages')
-      .select('*, sender:users(*)')
-      .eq('project_id', projectId)
-      .order('created_at');
+      .from("project_messages")
+      .select("*, sender:users(*)")
+      .eq("project_id", projectId)
+      .order("created_at");
+
     setProjectMessages(data ?? []);
     setProjectMsgLoading(false);
+
     setTimeout(() => {
-      if (projectMessagesContainerRef.current)
-        projectMessagesContainerRef.current.scrollTop = projectMessagesContainerRef.current.scrollHeight;
+      if (projectMessagesContainerRef.current) {
+        projectMessagesContainerRef.current.scrollTop =
+          projectMessagesContainerRef.current.scrollHeight;
+      }
     }, 60);
   };
 
@@ -1245,33 +1379,47 @@ function WorkspacePage() {
   const sendProjectMessage = async () => {
     const optimisticId = `temp-${Date.now()}`;
     const editorEl = projectEditorRef.current;
+
     if (!editorEl || !me || !activeProject || projectSending || projectUploading) return;
+
+    if (!canAccessActiveProjectChat) {
+      showToast("You do not have access to this project chat.", "error");
+      return;
+    }
 
     const html = editorEl.innerHTML;
     const content = sanitizeHtml(html);
+
     if (!content.trim() && !projectAttachFile) return;
 
-    editorEl.innerHTML = '';
-    projectNewMessageRef.current = '';
+    editorEl.innerHTML = "";
+    projectNewMessageRef.current = "";
     setIsProjectEditorEmpty(true);
-    setProjectNewMessage('');
+    setProjectNewMessage("");
     setProjectSending(true);
 
-    let attachData: { url: string; name: string; type: 'image' | 'file' } | null = null;
+    let attachData: { url: string; name: string; type: "image" | "file" } | null = null;
+
     if (projectAttachFile && projectAttachBytes) {
       setProjectUploading(true);
       attachData = await uploadToCloudinary(projectAttachFile, projectAttachBytes, showToast);
       setProjectUploading(false);
+
       if (!attachData) {
         editorEl.innerHTML = html;
         setProjectSending(false);
-        setProjectAttachFile(null); setProjectAttachBytes(null); setProjectAttachPreview(null);
+        setProjectAttachFile(null);
+        setProjectAttachBytes(null);
+        setProjectAttachPreview(null);
         return;
       }
-      setProjectAttachFile(null); setProjectAttachBytes(null); setProjectAttachPreview(null);
     }
 
-    const optimistic = {
+    setProjectAttachFile(null);
+    setProjectAttachBytes(null);
+    setProjectAttachPreview(null);
+
+    const optimistic: ProjectMessage = {
       id: optimisticId,
       project_id: activeProject.id,
       sender_id: me.id,
@@ -1283,60 +1431,124 @@ function WorkspacePage() {
       sender: me,
       parent_message_id: projectReplyingTo?.id ?? null,
       parent_snapshot: projectReplyingTo
-        ? { sendername: projectReplyingTo.sender?.full_name ?? 'Unknown', content: projectReplyingTo.content }
+        ? {
+            sendername: projectReplyingTo.sender?.full_name ?? "Unknown",
+            content: projectReplyingTo.content,
+          }
         : null,
-    } as any;
+      is_pinned: false,
+    } as ProjectMessage;
+
     setProjectMessages((prev) => [...prev, optimistic]);
+
     setTimeout(() => {
-      if (projectMessagesContainerRef.current)
-        projectMessagesContainerRef.current.scrollTop = projectMessagesContainerRef.current.scrollHeight;
+      if (projectMessagesContainerRef.current) {
+        projectMessagesContainerRef.current.scrollTop =
+          projectMessagesContainerRef.current.scrollHeight;
+      }
     }, 50);
 
-    const { data: inserted } = await supabase
-      .from('project_messages')
+    const { data: inserted, error } = await supabase
+      .from("project_messages")
       .insert({
         project_id: activeProject.id,
         sender_id: me.id,
-        content: content.trim() || '',
+        content: content.trim() || null,
         is_pinned: false,
         attachment_url: attachData?.url ?? null,
         attachment_name: attachData?.name ?? null,
         attachment_type: attachData?.type ?? null,
         parent_message_id: projectReplyingTo?.id ?? null,
         parent_snapshot: projectReplyingTo
-          ? { sendername: projectReplyingTo.sender?.full_name ?? 'Unknown', content: projectReplyingTo.content }
+          ? {
+              sendername: projectReplyingTo.sender?.full_name ?? "Unknown",
+              content: projectReplyingTo.content,
+            }
           : null,
       })
-      .select('*, sender:users(*)')
+      .select("*, sender:users(*)")
       .single();
 
-    if (inserted) {
-      setProjectMessages((prev) =>
-        prev.map((m) => m.id === optimisticId ? inserted : m)
-      );
+    if (error) {
+      setProjectMessages((prev) => prev.filter((m) => m.id !== optimisticId));
+      editorEl.innerHTML = html;
+      setProjectNewMessage(html);
+      showToast("Failed to send project message.", "error");
+      setProjectSending(false);
+      return;
     }
+
+    if (inserted) {
+      setProjectMessages((prev) => prev.map((m) => (m.id === optimisticId ? inserted : m)));
+    }
+
     setProjectReplyingTo(null);
     setProjectSending(false);
   };
 
   // Edit project message
   const saveProjectChatMessage = async () => {
-    if (!projectEditingId || !projectEditingContent.trim()) return;
+    if (!projectEditingId || !projectEditingContent.trim() || !me) return;
+
+    const target = projectMessages.find((m) => m.id === projectEditingId);
+    if (!target) {
+      showToast("Message not found.", "error");
+      return;
+    }
+
+    if (!canEditProjectMessage(target)) {
+      showToast("You can only edit your own non-system messages.", "error");
+      return;
+    }
+
     const content = sanitizeHtml(projectEditingContent);
-    await supabase
-      .from('project_messages')
-      .update({ content, is_edited: true, updated_at: new Date().toISOString() })
-      .eq('id', projectEditingId);
+
+    const { error } = await supabase
+      .from("project_messages")
+      .update({
+        content,
+        is_edited: true,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", projectEditingId);
+
+    if (error) {
+      showToast("Failed to update message.", "error");
+      return;
+    }
+
     setProjectMessages((prev) =>
-      prev.map((m) => m.id === projectEditingId ? { ...m, content, is_edited: true } : m)
+      prev.map((m) =>
+        m.id === projectEditingId ? { ...m, content, is_edited: true } : m
+      )
     );
+
     setProjectEditingId(null);
-    setProjectEditingContent('');
+    setProjectEditingContent("");
   };
 
   // Delete project message
   const deleteProjectChatMessage = async (id: string) => {
-    await supabase.from('project_messages').delete().eq('id', id);
+    if (!me) return;
+
+    const target = projectMessages.find((m) => m.id === id);
+    if (!target) {
+      showToast("Message not found.", "error");
+      return;
+    }
+
+    if (!canDeleteProjectMessage(target)) {
+      showToast("You do not have permission to delete this message.", "error");
+      return;
+    }
+
+    const { error } = await supabase.from("project_messages").delete().eq("id", id);
+
+    if (error) {
+      showToast("Failed to delete message.", "error");
+      return;
+    }
+
     setProjectMessages((prev) => prev.filter((m) => m.id !== id));
     setProjectOpenMenuId(null);
   };
@@ -1476,19 +1688,35 @@ function WorkspacePage() {
   // Create task or milestone
   const createProjectTask = async () => {
     if (!activeProject || !newTaskTitle.trim() || !me) return;
-    if (!newTaskAssigneeId) {
-      showToast('Please select a team member to assign this task.', 'error');
+
+    if (!canCreateProjectTask) {
+      showToast("You do not have permission to create tasks in this project.", "error");
       return;
     }
+
+    if (!newTaskAssigneeId) {
+      showToast("Please select a team member to assign this task.", "error");
+      return;
+    }
+
+    const assigneeExists = projectMembers.some((m) => m.user_id === newTaskAssigneeId);
+    if (!assigneeExists) {
+      showToast("Selected assignee is not a project member.", "error");
+      return;
+    }
+
     setCreatingTask(true);
 
-    // Upload attachment if present
     let attachUrl: string | null = null;
     let attachName: string | null = null;
-    let attachType: 'image' | 'file' | null = null;
+    let attachType: "image" | "file" | null = null;
+
     if (newTaskFile && newTaskBytes) {
       const result = await uploadToCloudinary(newTaskFile, newTaskBytes, showToast);
-      if (!result) { setCreatingTask(false); return; }
+      if (!result) {
+        setCreatingTask(false);
+        return;
+      }
       attachUrl = result.url;
       attachName = result.name;
       attachType = result.type;
@@ -1497,14 +1725,14 @@ function WorkspacePage() {
     const assigneeMember = projectMembers.find((m: any) => m.user_id === newTaskAssigneeId);
 
     const { data, error } = await supabase
-      .from('tasks')
+      .from("tasks")
       .insert({
         project_id: activeProject.id,
         created_by: me.id,
         type: newTaskType,
         title: newTaskTitle.trim(),
         description: newTaskDesc.trim() || null,
-        status: 'open',
+        status: "open",
         priority: newTaskPriority,
         assignee_id: newTaskAssigneeId || null,
         due_date: newTaskDueDate || null,
@@ -1512,27 +1740,33 @@ function WorkspacePage() {
         attachment_name: attachName,
         attachment_type: attachType,
       })
-      .select('*, assignee:users!tasks_assignee_id_fkey(*)')
+      .select("*, assignee:users!tasks_assignee_id_fkey(*)")
       .single();
+
+    if (error) {
+      showToast(`Failed to create ${newTaskType}: ${error.message}`, "error");
+      setCreatingTask(false);
+      return;
+    }
 
     if (data) {
       setProjectTasks((prev) => [data as ProjectTask, ...prev]);
+
       if (newTaskAssigneeId) {
-        await postTaskEvent(activeProject.id, 'taskassigned', data as ProjectTask, {
-          assignedtoname: assigneeMember?.profile?.full_name ?? '',
-          assignedbyname: me?.full_name ?? '',
+        await postTaskEvent(activeProject.id, "taskassigned", data as ProjectTask, {
+          assignedtoname: assigneeMember?.profile?.full_name ?? "",
+          assignedbyname: me?.full_name ?? "",
         });
       }
-      showToast(`${newTaskType === 'milestone' ? 'Milestone' : 'Task'} created!`, 'success');
-    }
-    if (error) showToast('Failed to create: ' + error.message, 'error');
 
-    // Reset all modal state
-    setNewTaskTitle('');
-    setNewTaskDesc('');
-    setNewTaskPriority('medium');
-    setNewTaskAssigneeId('');
-    setNewTaskDueDate('');
+      showToast(`${newTaskType === "milestone" ? "Milestone" : "Task"} created!`, "success");
+    }
+
+    setNewTaskTitle("");
+    setNewTaskDesc("");
+    setNewTaskPriority("medium");
+    setNewTaskAssigneeId("");
+    setNewTaskDueDate("");
     setNewTaskFile(null);
     setNewTaskBytes(null);
     setShowCreateTask(false);
@@ -1541,61 +1775,135 @@ function WorkspacePage() {
 
   const saveTaskTitle = async () => {
     if (!activeTask || !titleDraft.trim()) return;
-    const trimmed = titleDraft.trim();
-    const { error } = await supabase
-      .from('tasks')
-      .update({ title: trimmed, updated_at: new Date().toISOString() })
-      .eq('id', activeTask.id);
-    if (!error) {
-      const updated = { ...activeTask, title: trimmed };
-      setActiveTask(updated);
-      setProjectTasks(prev => prev.map(t => t.id === activeTask.id ? updated : t));
-      setEditingTitle(false);
+
+    if (!canEditTask) {
+      showToast("You do not have permission to edit this task.", "error");
+      return;
     }
+
+    const trimmed = titleDraft.trim();
+
+    const { error } = await supabase
+      .from("tasks")
+      .update({
+        title: trimmed,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", activeTask.id);
+
+    if (error) {
+      showToast("Failed to update task title.", "error");
+      return;
+    }
+
+    const updated = { ...activeTask, title: trimmed };
+    setActiveTask(updated);
+    setProjectTasks((prev) => prev.map((t) => (t.id === activeTask.id ? updated : t)));
+    setEditingTitle(false);
   };
 
   const saveTaskDescription = async () => {
     if (!activeTask) return;
-    const trimmed = descriptionDraft.trim() || null;
-    const { error } = await supabase
-      .from('tasks')
-      .update({ description: trimmed, updated_at: new Date().toISOString() })
-      .eq('id', activeTask.id);
-    if (!error) {
-      const updated = { ...activeTask, description: trimmed };
-      setActiveTask(updated);
-      setProjectTasks(prev => prev.map(t => t.id === activeTask.id ? updated : t));
-      setEditingDescription(false);
+
+    if (!canEditTask) {
+      showToast("You do not have permission to edit this task.", "error");
+      return;
     }
+
+    const trimmed = descriptionDraft.trim() || null;
+
+    const { error } = await supabase
+      .from("tasks")
+      .update({
+        description: trimmed,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", activeTask.id);
+
+    if (error) {
+      showToast("Failed to update task description.", "error");
+      return;
+    }
+
+    const updated = { ...activeTask, description: trimmed };
+    setActiveTask(updated);
+    setProjectTasks((prev) => prev.map((t) => (t.id === activeTask.id ? updated : t)));
+    setEditingDescription(false);
   };
 
   // Update task status
   const updateTaskStatus = async (taskId: string, newStatus: TaskStatus) => {
     const task = projectTasks.find((t) => t.id === taskId);
-    if (!task || !activeProject) return;
+    if (!task || !activeProject || !me) return;
+
+    const isAssignee = task.assignee_id === me.id;
+    const isCreator = task.created_by === me.id;
+    const canAdminTask = canManageProject;
+
+    const allowed =
+      task.type === "task"
+        ? (
+            (newStatus === "complete" && (isAssignee || isCreator || canAdminTask)) ||
+            (["open", "active"].includes(newStatus) && (isCreator || canAdminTask))
+          )
+        : (
+            task.type === "milestone" &&
+            newStatus === "complete" &&
+            canAdminTask
+          );
+
+    if (!allowed) {
+      showToast("You do not have permission to change this task status.", "error");
+      return;
+    }
 
     const updates: Record<string, any> = {
       status: newStatus,
       updated_at: new Date().toISOString(),
     };
-    if (newStatus === 'complete') {
-      updates.completed_by = me!.id;
+
+    if (newStatus === "complete") {
+      updates.completed_by = me.id;
       updates.completed_at = new Date().toISOString();
     }
 
-    const { error } = await supabase.from('tasks').update(updates).eq('id', taskId);
-    if (!error) {
-      setProjectTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, ...updates } : t)));
-      setActiveTask((prev) => (prev?.id === taskId ? { ...prev, ...updates } : prev));
-      if (newStatus === 'complete') {
-        await postTaskEvent(activeProject.id, 'taskcompleted', { ...task, ...updates } as ProjectTask);
-      }
+    const { error } = await supabase.from("tasks").update(updates).eq("id", taskId);
+
+    if (error) {
+      showToast("Failed to update task status.", "error");
+      return;
+    }
+
+    setProjectTasks((prev) => prev.map((t) => (t.id === taskId ? { ...t, ...updates } : t)));
+    setActiveTask((prev) => (prev?.id === taskId ? { ...prev, ...updates } : prev));
+
+    if (newStatus === "complete") {
+      await postTaskEvent(activeProject.id, "taskcompleted", {
+        ...task,
+        ...updates,
+      } as ProjectTask);
     }
   };
 
   // Submit milestone work (by assignee)
   const submitMilestoneWork = async () => {
     if (!activeTask || !activeProject || !me) return;
+
+    if (activeTask.type !== "milestone") {
+      showToast("Only milestones can be submitted for review.", "error");
+      return;
+    }
+
+    if (activeTask.assignee_id !== me.id) {
+      showToast("Only the assigned member can submit this milestone.", "error");
+      return;
+    }
+
+    if (!["open", "active", "changesrequested"].includes(activeTask.status)) {
+      showToast("This milestone is not in a submittable state.", "error");
+      return;
+    }
+
     setSubmittingTask(true);
 
     let fileUrl: string | null = null;
@@ -1603,13 +1911,17 @@ function WorkspacePage() {
 
     if (submitFile && submitBytes) {
       const result = await uploadToCloudinary(submitFile, submitBytes, showToast);
-      if (result) { fileUrl = result.url; fileName = result.name; }
-      else { setSubmittingTask(false); return; } // upload failed, bail
+      if (result) {
+        fileUrl = result.url;
+        fileName = result.name;
+      } else {
+        setSubmittingTask(false);
+        return;
+      }
     }
 
-
     const updates = {
-      status: 'in_review' as TaskStatus,
+      status: "in_review" as TaskStatus,
       submission_text: submitText.trim() || null,
       submission_url: fileUrl,
       submission_filename: fileName,
@@ -1617,61 +1929,98 @@ function WorkspacePage() {
       updated_at: new Date().toISOString(),
     };
 
-    const { error } = await supabase.from('tasks').update(updates).eq('id', activeTask.id);
-    if (!error) {
-      const updated = { ...activeTask, ...updates };
-      setProjectTasks((prev) => prev.map((t) => (t.id === activeTask.id ? updated : t)));
-      setActiveTask(updated);
-      await postTaskEvent(activeProject.id, 'tasksubmitted', updated, {
-        note: submitText.trim(),
-        submissionurl: fileUrl ?? undefined,
-        submissionfilename: fileName ?? undefined,
-      });
-      setSubmitText('');
-      setSubmitFile(null);
-      setSubmitBytes(null);
-      setSubmitPreview(null);
+    const { error } = await supabase.from("tasks").update(updates).eq("id", activeTask.id);
 
-      showToast('Work submitted for review!', 'success');
+    if (error) {
+      showToast("Failed to submit milestone work.", "error");
+      setSubmittingTask(false);
+      return;
     }
+
+    const updated = { ...activeTask, ...updates };
+    setProjectTasks((prev) => prev.map((t) => (t.id === activeTask.id ? updated : t)));
+    setActiveTask(updated);
+
+    await postTaskEvent(activeProject.id, "tasksubmitted", updated, {
+      note: submitText.trim(),
+      submissionurl: fileUrl ?? undefined,
+      submissionfilename: fileName ?? undefined,
+    });
+
+    setSubmitText("");
+    setSubmitFile(null);
+    setSubmitBytes(null);
+    setSubmitPreview(null);
+    showToast("Work submitted for review!", "success");
     setSubmittingTask(false);
   };
 
   // Request revision (by admin)
   const requestTaskRevision = async () => {
     if (!activeTask || !activeProject || !revisionNote.trim()) return;
+
+    if (activeTask.type !== "milestone" || !canManageProject) {
+      showToast("You do not have permission to request changes.", "error");
+      return;
+    }
+
+    if (activeTask.status !== "in_review") {
+      showToast("Changes can only be requested while the milestone is in review.", "error");
+      return;
+    }
+
     setSubmittingTask(true);
 
     const updates = {
-      status: 'changes_requested' as TaskStatus,
+      status: "changes_requested" as TaskStatus,
       revision_note: revisionNote.trim(),
       revision_count: (activeTask.revision_count ?? 0) + 1,
       updated_at: new Date().toISOString(),
     };
 
-    const { error } = await supabase.from('tasks').update(updates).eq('id', activeTask.id);
-    if (!error) {
-      const updated = { ...activeTask, ...updates };
-      setProjectTasks((prev) => prev.map((t) => (t.id === activeTask.id ? updated : t)));
-      setActiveTask(updated);
-      await postTaskEvent(activeProject.id, 'taskchangesrequested', updated, {
-        note: revisionNote.trim(),
-      });
-      setRevisionNote('');
-      setShowRevisionInput(false);
-      showToast('Changes requested', 'info');
+    const { error } = await supabase.from("tasks").update(updates).eq("id", activeTask.id);
+
+    if (error) {
+      showToast("Failed to request changes.", "error");
+      setSubmittingTask(false);
+      return;
     }
+
+    const updated = { ...activeTask, ...updates };
+    setProjectTasks((prev) => prev.map((t) => (t.id === activeTask.id ? updated : t)));
+    setActiveTask(updated);
+
+    await postTaskEvent(activeProject.id, "taskchangesrequested", updated, {
+      note: revisionNote.trim(),
+    });
+
+    setRevisionNote("");
+    setShowRevisionInput(false);
+    showToast("Changes requested.", "info");
     setSubmittingTask(false);
   };
 
   // Delete task
   const deleteProjectTask = async (taskId: string) => {
-    const { error } = await supabase.from('tasks').delete().eq('id', taskId);
-    if (!error) {
-      setProjectTasks((prev) => prev.filter((t) => t.id !== taskId));
-      if (activeTask?.id === taskId) { setActiveTask(null); setShowTaskPanel(false); }
-      showToast('Deleted', 'info');
+    if (!canManageProject) {
+      showToast("You do not have permission to delete tasks.", "error");
+      return;
     }
+
+    const { error } = await supabase.from("tasks").delete().eq("id", taskId);
+
+    if (error) {
+      showToast("Failed to delete task.", "error");
+      return;
+    }
+
+    setProjectTasks((prev) => prev.filter((t) => t.id !== taskId));
+    if (activeTask?.id === taskId) {
+      setActiveTask(null);
+      setShowTaskPanel(false);
+    }
+
+    showToast("Deleted.", "info");
   };
 
   const loadMyWorkspaces = async (userId: string) => {
@@ -1697,7 +2046,10 @@ function WorkspacePage() {
     const { data: profile } = await supabase
       .from("users").select("*").eq("id", currentUserId).single();
 
-    if (!profile?.full_name) return router.replace("/onboarding");
+    if (!profile?.full_name || !profile?.job_title) {
+      router.replace("/main/onboarding");
+      return;
+    }
     setMe(profile);
     await loadMyWorkspaces(currentUserId);
 
@@ -1717,7 +2069,7 @@ function WorkspacePage() {
         .limit(1)
         .single();
       if (anyMembership) return router.replace(`/workspace/${anyMembership.workspace_id}`);
-      return router.replace("/onboarding");
+      return router.replace("/main/onboarding");
     }
 
     const { data: ws } = await supabase
@@ -2149,16 +2501,55 @@ function WorkspacePage() {
 
   // ─── Load channel messages ────────────────────────────────
   const loadChannelMessages = async (channelId: string) => {
+    if (!me) return;
+
+    const channel =
+      activeChannel?.id === channelId
+        ? activeChannel
+        : channels.find((c) => c.id === channelId);
+
+    if (channel?.is_private) {
+      const { data: membership } = await supabase
+        .from("channel_members")
+        .select("channel_id")
+        .eq("channel_id", channelId)
+        .eq("user_id", me.id)
+        .single();
+
+      if (!membership) {
+        setMessages([]);
+        showToast("You do not have access to this private channel.", "error");
+        return;
+      }
+    }
+
     const { data } = await supabase
       .from("messages")
       .select("*, sender:users(*)")
       .eq("channel_id", channelId)
       .order("created_at");
-    setMessages(data || []);
+
+    setMessages(data ?? []);
   };
 
   // ─── Switch active channel ────────────────────────────────
   const switchChannel = async (channel: Channel) => {
+    if (!me) return;
+
+    if (channel.is_private) {
+      const { data: membership } = await supabase
+        .from("channel_members")
+        .select("channel_id")
+        .eq("channel_id", channel.id)
+        .eq("user_id", me.id)
+        .single();
+
+      if (!membership) {
+        showToast("You do not have access to this private channel.", "error");
+        return;
+      }
+    }
+
     setView("channel");
     setActiveDmUserId(null);
     setActiveDmUser(null);
@@ -2239,6 +2630,61 @@ function WorkspacePage() {
   const isWorkspaceAdmin = isSuperAdmin || members.find(m => m.user_id === me?.id)?.role === 'admin';
   // Keep isAdmin as alias for backward compat with existing code
   const isAdmin = isWorkspaceAdmin;
+
+  const isProjectCreator = !!activeProject && activeProject.created_by === me?.id;
+  const myProjectMembership = projectMembers.find((pm) => pm.user_id === me?.id);
+  const isProjectAdmin = isProjectCreator || myProjectMembership?.role === "admin" || isWorkspaceAdmin;
+  const canManageProject = !!activeProject && !!me && isProjectAdmin;
+
+  const activeTaskAssignee = activeTask?.assignee_id === me?.id;
+  const canCreateProjectTask = canManageProject;
+  const canEditTask =
+    !!activeTask &&
+    !!me &&
+    (canManageProject || activeTask.created_by === me.id || activeTask.assignee_id === me.id);
+  const canDeleteTask = !!activeTask && !!me && canManageProject;
+  const canReviewMilestone =
+    !!activeTask && !!me && activeTask.type === "milestone" && canManageProject;
+  const canSubmitMilestone =
+    !!activeTask &&
+    !!me &&
+    activeTask.type === "milestone" &&
+    activeTask.assignee_id === me.id;
+
+  const canAccessActiveProjectChat =
+    !!activeProject &&
+    !!me &&
+    (!activeProject.is_private || !!myProjectMembership);
+
+  const canModerateProjectMessage = (msg: ProjectMessage) =>
+    !!me && (msg.sender_id === me.id || canManageProject);
+
+  const canPinProjectMessage = (_msg: ProjectMessage) => canManageProject;
+  const canEditProjectMessage = (msg: ProjectMessage) =>
+    !!me && !msg.is_system && msg.sender_id === me.id;
+  const canDeleteProjectMessage = (msg: ProjectMessage) =>
+    !!me && !msg.is_system && (msg.sender_id === me.id || canManageProject);
+
+  const myChannelMembership = channelMembers.find((m) => m.user_id === me?.id);
+
+  const canAccessActiveChannel =
+    !!activeChannel &&
+    !!me &&
+    (!activeChannel.is_private || !!myChannelMembership || activeChannel.is_default);
+
+  const canPinChannelMessage = (_msg: Message) => !!me && isWorkspaceAdmin;
+
+  const canEditChannelMessage = (msg: Message) =>
+    !!me && !msg.is_system && msg.sender_id === me.id;
+
+  const canDeleteChannelMessage = (msg: Message) =>
+    !!me && !msg.is_system && (msg.sender_id === me.id || isWorkspaceAdmin);
+
+  const canEditDmMessage = (msg: DM) =>
+    !!me && msg.sender_id === me.id;
+
+  const canDeleteDmMessage = (msg: DM) =>
+    !!me && msg.sender_id === me.id;
 
   // ─── Load workspace members ───────────────────────────────
   const loadMembers = async () => {
@@ -2324,6 +2770,11 @@ function WorkspacePage() {
     const editorEl = editorRef.current;
     if (!editorEl || !me || !activeChannel || sending || uploading) return;
 
+    if (!canAccessActiveChannel) {
+      showToast("You do not have access to send messages in this channel.", "error");
+      return;
+    }
+
     const html = editorEl.innerHTML;
     const content = sanitizeHtml(html);
     if (!content.trim() && !attachmentFile) return;
@@ -2332,11 +2783,12 @@ function WorkspacePage() {
     setNewMessage("");
     setSending(true);
 
-    let attachData: { url: string; name: string; type: 'image' | 'file' } | null = null;
+    let attachData: { url: string; name: string; type: "image" | "file" } | null = null;
     if (attachmentFile && attachmentBytes) {
       setUploading(true);
       attachData = await uploadToCloudinary(attachmentFile, attachmentBytes, showToast);
       setUploading(false);
+
       if (!attachData) {
         editorEl.innerHTML = html;
         setNewMessage(html);
@@ -2346,10 +2798,11 @@ function WorkspacePage() {
         setAttachmentPreview(null);
         return;
       }
-      setAttachmentFile(null);
-      setAttachmentBytes(null);
-      setAttachmentPreview(null);
     }
+
+    setAttachmentFile(null);
+    setAttachmentBytes(null);
+    setAttachmentPreview(null);
 
     const optimisticMsg: Message = {
       id: `temp-${Date.now()}`,
@@ -2364,46 +2817,57 @@ function WorkspacePage() {
       attachment_name: attachData?.name ?? null,
       attachment_type: attachData?.type ?? null,
       parent_message_id: replyingTo?.id ?? null,
-      parent_snapshot: replyingTo ? {
-        sendername: replyingTo.sender?.full_name ?? 'Unknown',
-        content: replyingTo.content,
-      } : null,
+      parent_snapshot: replyingTo
+        ? {
+            sendername: replyingTo.sender?.full_name ?? "Unknown",
+            content: replyingTo.content,
+          }
+        : null,
     };
-    setMessages(prev => [...prev, optimisticMsg]);
+
+    setMessages((prev) => [...prev, optimisticMsg]);
 
     const { data: sent, error } = await supabase
       .from("messages")
       .insert({
         channel_id: activeChannel.id,
         sender_id: me.id,
-        content: content || '',
+        content: content || null,
         is_pinned: false,
         is_system: false,
         attachment_url: attachData?.url ?? null,
         attachment_name: attachData?.name ?? null,
         attachment_type: attachData?.type ?? null,
         parent_message_id: replyingTo?.id ?? null,
-        parent_snapshot: replyingTo ? {
-          sendername: replyingTo.sender?.full_name ?? 'Unknown',
-          content: replyingTo.content,
-        } : null,
+        parent_snapshot: replyingTo
+          ? {
+              sendername: replyingTo.sender?.full_name ?? "Unknown",
+              content: replyingTo.content,
+            }
+          : null,
       })
       .select("*, sender:users(*)")
       .single();
 
     if (error) {
-      setMessages(prev => prev.filter(m => m.id !== optimisticMsg.id));
+      setMessages((prev) => prev.filter((m) => m.id !== optimisticMsg.id));
       editorEl.innerHTML = html;
       setNewMessage(html);
-    } else if (sent) {
-      setMessages(prev => {
-        const withoutDupe = prev.filter(m => m.id !== sent.id);
-        return withoutDupe.map(m => m.id === optimisticMsg.id ? sent : m);
+      setSending(false);
+      showToast("Failed to send message.", "error");
+      return;
+    }
+
+    if (sent) {
+      setMessages((prev) => {
+        const withoutDupe = prev.filter((m) => m.id !== sent.id);
+        return withoutDupe.map((m) => (m.id === optimisticMsg.id ? sent : m));
       });
     }
 
     setSending(false);
     setReplyingTo(null);
+
     setTimeout(() => {
       if (editorRef.current) {
         editorRef.current.focus();
@@ -2535,10 +2999,31 @@ function WorkspacePage() {
   // ─── Edit channel message ─────────────────────────────────
   const saveEditMessage = async (msgId: string) => {
     const trimmed = editingContent.trim();
-    if (!trimmed) return;
-    await supabase.from("messages").update({ content: trimmed }).eq("id", msgId);
-    setMessages(prev =>
-      prev.map(m => m.id === msgId ? { ...m, content: trimmed } : m)
+    if (!trimmed || !me) return;
+
+    const target = messages.find((m) => m.id === msgId);
+    if (!target) {
+      showToast("Message not found.", "error");
+      return;
+    }
+
+    if (!canEditChannelMessage(target)) {
+      showToast("You can only edit your own non-system messages.", "error");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("messages")
+      .update({ content: trimmed })
+      .eq("id", msgId);
+
+    if (error) {
+      showToast("Failed to update message.", "error");
+      return;
+    }
+
+    setMessages((prev) =>
+      prev.map((m) => (m.id === msgId ? { ...m, content: trimmed } : m))
     );
     setEditingMessageId(null);
     setEditingContent("");
@@ -2546,37 +3031,93 @@ function WorkspacePage() {
 
   // ─── Delete channel message ───────────────────────────────
   const deleteMessage = async (msgId: string) => {
+    if (!me) return;
+
+    const target = messages.find((m) => m.id === msgId);
+    if (!target) {
+      showToast("Message not found.", "error");
+      return;
+    }
+
+    if (!canDeleteChannelMessage(target)) {
+      showToast("You do not have permission to delete this message.", "error");
+      return;
+    }
+
     setOpenMenuMessageId(null);
-    await supabase.from("messages").delete().eq("id", msgId);
-    setMessages(prev => prev.filter(m => m.id !== msgId));
+
+    const { error } = await supabase.from("messages").delete().eq("id", msgId);
+
+    if (error) {
+      showToast("Failed to delete message.", "error");
+      return;
+    }
+
+    setMessages((prev) => prev.filter((m) => m.id !== msgId));
   };
 
   // ─── Toggle pin ───────────────────────────────────────────
   // Pin a project chat message (uses project_messages table)
   const togglePinProjectMessage = async (msg: ProjectMessage) => {
-    const { data } = await supabase
-      .from('project_messages')
+    if (!canPinProjectMessage(msg)) {
+      showToast("You do not have permission to pin messages in this project.", "error");
+      return;
+    }
+
+    if (msg.is_system) {
+      showToast("System activity messages cannot be pinned.", "error");
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("project_messages")
       .update({ is_pinned: !msg.is_pinned })
-      .eq('id', msg.id)
+      .eq("id", msg.id)
       .select()
       .single();
+
+    if (error) {
+      showToast("Failed to update pin state.", "error");
+      return;
+    }
+
     if (data) {
-      setProjectMessages(prev =>
-        prev.map(m => m.id === data.id ? { ...m, is_pinned: data.is_pinned } : m)
+      setProjectMessages((prev) =>
+        prev.map((m) => (m.id === data.id ? { ...m, is_pinned: data.is_pinned } : m))
       );
     }
+
+    setProjectOpenMenuId(null);
   };
 
   const togglePinMessage = async (msg: Message) => {
-    const { data } = await supabase
+    if (!canPinChannelMessage(msg)) {
+      showToast("Only workspace admins can pin channel messages.", "error");
+      return;
+    }
+
+    if (msg.is_system) {
+      showToast("System messages cannot be pinned.", "error");
+      return;
+    }
+
+    const { data, error } = await supabase
       .from("messages")
       .update({ is_pinned: !msg.is_pinned })
       .eq("id", msg.id)
       .select()
       .single();
+
+    if (error) {
+      showToast("Failed to update pin state.", "error");
+      return;
+    }
+
     if (data) {
-      setMessages(prev =>
-        prev.map(m => m.id === data.id ? { ...m, is_pinned: data.is_pinned, sender: m.sender } : m)
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === data.id ? { ...m, is_pinned: data.is_pinned, sender: m.sender } : m
+        )
       );
     }
   };
@@ -2629,10 +3170,31 @@ function WorkspacePage() {
   // ─── Edit DM message ──────────────────────────────────────
   const saveDmEditMessage = async (msgId: string) => {
     const trimmed = dmEditingContent.trim();
-    if (!trimmed) return;
-    await supabase.from("direct_messages").update({ content: trimmed }).eq("id", msgId);
-    setDmMessages(prev =>
-      prev.map(m => m.id === msgId ? { ...m, content: trimmed } : m)
+    if (!trimmed || !me) return;
+
+    const target = dmMessages.find((m) => m.id === msgId);
+    if (!target) {
+      showToast("Message not found.", "error");
+      return;
+    }
+
+    if (!canEditDmMessage(target)) {
+      showToast("You can only edit your own DM messages.", "error");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("direct_messages")
+      .update({ content: trimmed })
+      .eq("id", msgId);
+
+    if (error) {
+      showToast("Failed to update DM.", "error");
+      return;
+    }
+
+    setDmMessages((prev) =>
+      prev.map((m) => (m.id === msgId ? { ...m, content: trimmed } : m))
     );
     setDmEditingMessageId(null);
     setDmEditingContent("");
@@ -2640,24 +3202,53 @@ function WorkspacePage() {
 
   // ─── Delete DM message ────────────────────────────────────
   const deleteDmMessage = async (msgId: string) => {
+    if (!me) return;
+
+    const target = dmMessages.find((m) => m.id === msgId);
+    if (!target) {
+      showToast("Message not found.", "error");
+      return;
+    }
+
+    if (!canDeleteDmMessage(target)) {
+      showToast("You do not have permission to delete this DM.", "error");
+      return;
+    }
+
     setDmOpenMenuMessageId(null);
-    await supabase.from("direct_messages").delete().eq("id", msgId);
-    setDmMessages(prev => prev.filter(m => m.id !== msgId));
+
+    const { error } = await supabase.from("direct_messages").delete().eq("id", msgId);
+
+    if (error) {
+      showToast("Failed to delete DM.", "error");
+      return;
+    }
+
+    setDmMessages((prev) => prev.filter((m) => m.id !== msgId));
   };
 
-  const markProjectMessageAsUnread = (msg: ProjectMessage) => {
-    if (!activeProject) return;
+  const markProjectMessageAsUnread = async (msg: ProjectMessage) => {
+    if (!activeProject || !me || !canAccessActiveProjectChat) return;
+
     setProjectOpenMenuId(null);
     setProjectHoveredId(null);
-    const justBefore = new Date(new Date(msg.created_at).getTime() - 1).toISOString();
-    const msgsAfter = projectMessages.filter(m => m.created_at > msg.created_at);
-    setProjectChatUnread(prev => ({ ...prev, [activeProject.id]: msgsAfter.length }));
 
-    supabase.from('project_chat_reads').upsert({
-      user_id: me?.id,
-      project_id: activeProject.id,
-      last_read_at: justBefore
-    }).then();
+    const justBefore = new Date(new Date(msg.created_at).getTime() - 1).toISOString();
+    const msgsAfter = projectMessages.filter((m) => m.created_at > msg.created_at);
+
+    setProjectChatUnread((prev) => ({
+      ...prev,
+      [activeProject.id]: msgsAfter.length,
+    }));
+
+    await supabase.from("project_chat_reads").upsert(
+      {
+        user_id: me.id,
+        project_id: activeProject.id,
+        last_read_at: justBefore,
+      },
+      { onConflict: "project_id,user_id" }
+    );
   };
 
   // ─── Mark DM as unread ────────────────────────────────────
@@ -2780,15 +3371,12 @@ function WorkspacePage() {
 
   // ─── Save profile edit ────────────────────────────────────
   const saveProfileEdit = async () => {
-    if (!me || !profileEditName.trim()) return;
+    if (!me || !profileEditName.trim() || !userId) return;
     setSavingProfile(true);
-    const { data: { session } } = await supabase.auth.getSession();
-    const user = session?.user;
-    if (!user) { setSavingProfile(false); return; }
 
     let avatarUrl = me.avatar_url;
     if (profileEditImageFile) {
-      const filePath = `${user.id}/avatar`;
+      const filePath = `${userId}/avatar`;
       const { error: uploadError } = await supabase.storage
         .from("avatars")
         .upload(filePath, profileEditImageFile, { upsert: true, contentType: profileEditImageFile.type });
@@ -2805,7 +3393,7 @@ function WorkspacePage() {
         job_title: profileEditRole.trim() || null,
         avatar_url: avatarUrl,
       })
-      .eq("id", user.id)
+      .eq("id", userId)
       .select()
       .single();
 
@@ -2817,8 +3405,8 @@ function WorkspacePage() {
   };
 
   async function handleLogout() {
-    await supabase.auth.signOut();
-    router.replace("/");
+    setShowLogoutConfirm(false);
+    goToCentralLogout(window.location.origin);
   }
 
   // ─── Save workspace edit ──────────────────────────────────
@@ -2977,50 +3565,208 @@ function WorkspacePage() {
   };
 
   // ─── Add member to channel ────────────────────────────────
-  const addMemberToChannel = async (userId: string) => {
-    if (!activeChannel) return;
-    await supabase.from("channel_members").insert({
+  const addMemberToChannel = async (targetUserId: string) => {
+    if (!activeChannel || !isWorkspaceAdmin) {
+      showToast("Only admins can add members to channels.", "error");
+      return;
+    }
+
+    const exists = channelMembers.find((m) => m.user_id === targetUserId);
+    if (exists) return;
+
+    const { error } = await supabase.from("channel_members").insert({
       channel_id: activeChannel.id,
-      user_id: userId,
+      user_id: targetUserId,
     });
+
+    if (error) {
+      showToast("Failed to add member to channel.", "error");
+      return;
+    }
+
     await loadChannelMembers();
   };
 
   // ─── Remove member from channel ───────────────────────────
-  const removeMemberFromChannel = async (userId: string) => {
-    if (!activeChannel) return;
-    await supabase.from("channel_members").delete()
+  const removeMemberFromChannel = async (targetUserId: string) => {
+    if (!activeChannel || !isWorkspaceAdmin) {
+      showToast("Only admins can remove members from channels.", "error");
+      return;
+    }
+
+    if (activeChannel.is_default) {
+      showToast("Members cannot be removed from the default channel.", "error");
+      return;
+    }
+
+    const { error } = await supabase
+      .from("channel_members")
+      .delete()
       .eq("channel_id", activeChannel.id)
-      .eq("user_id", userId);
+      .eq("user_id", targetUserId);
+
+    if (error) {
+      showToast("Failed to remove member from channel.", "error");
+      return;
+    }
+
     await loadChannelMembers();
   };
 
-  const updateWorkspaceMemberRole = async (targetUserId: string, newRole: 'admin' | 'member') => {
-    // Super admin (owner) can never be demoted
-    if (targetUserId === workspace?.owner_id) return;
-    // Only super admin or admin can change roles
-    if (!isWorkspaceAdmin) return;
-    const { error } = await supabase
-      .from('workspace_members')
-      .update({ role: newRole })
-      .eq('workspace_id', workspaceId)
-      .eq('user_id', targetUserId);
-    if (!error) {
-      setMembers(prev =>
-        prev.map(m => m.user_id === targetUserId ? { ...m, role: newRole } : m)
-      );
-      showToast(`Role updated to ${newRole === 'admin' ? 'Admin' : 'Member'}`, 'success');
+  const updateWorkspaceMemberRole = async (
+    targetUserId: string,
+    newRole: "admin" | "member"
+  ) => {
+    if (!workspace || !me) return;
+
+    if (!isWorkspaceAdmin) {
+      showToast("Only workspace admins can change roles.", "error");
+      return;
     }
+
+    if (targetUserId === workspace.owner_id) {
+      showToast("Workspace owner role cannot be changed.", "error");
+      return;
+    }
+
+    if (targetUserId === me.id) {
+      showToast("You cannot change your own role here.", "error");
+      return;
+    }
+
+    const existing = members.find((m) => m.user_id === targetUserId);
+    if (!existing) {
+      showToast("Member not found.", "error");
+      return;
+    }
+
+    if (existing.role === newRole) {
+      return;
+    }
+
+    const { error } = await supabase
+      .from("workspace_members")
+      .update({ role: newRole })
+      .eq("workspace_id", workspaceId)
+      .eq("user_id", targetUserId);
+
+    if (error) {
+      showToast("Failed to update role.", "error");
+      return;
+    }
+
+    setMembers((prev) =>
+      prev.map((m) =>
+        m.user_id === targetUserId ? { ...m, role: newRole } : m
+      )
+    );
+
+    showToast(`Role updated to ${newRole === "admin" ? "Admin" : "Member"}.`, "success");
+  };
+
+  // ─── Remove workspace member ──────────────────────────────
+  const removeWorkspaceMember = async (targetUserId: string) => {
+    if (!workspace || !me) return;
+
+    if (!isWorkspaceAdmin) {
+      showToast("Only workspace admins can remove members.", "error");
+      return;
+    }
+
+    if (targetUserId === workspace.owner_id) {
+      showToast("Workspace owner cannot be removed.", "error");
+      return;
+    }
+
+    if (targetUserId === me.id) {
+      showToast("Use leave workspace instead.", "error");
+      return;
+    }
+
+    const { data: workspaceChannels } = await supabase
+      .from("channels")
+      .select("id")
+      .eq("workspace_id", workspaceId);
+
+    const channelIds = workspaceChannels?.map((c) => c.id) ?? [];
+
+    const { error } = await supabase
+      .from("workspace_members")
+      .delete()
+      .eq("workspace_id", workspaceId)
+      .eq("user_id", targetUserId);
+
+    if (error) {
+      showToast("Failed to remove member.", "error");
+      return;
+    }
+
+    if (channelIds.length > 0) {
+      await supabase
+        .from("channel_members")
+        .delete()
+        .eq("user_id", targetUserId)
+        .in("channel_id", channelIds);
+    }
+
+    setMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
+    setChannelMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
+    setNonChannelMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
+    setProjectMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
+
+    showToast("Member removed from workspace.", "success");
   };
 
   // ─── Leave workspace ──────────────────────────────────────
   const leaveWorkspace = async () => {
-    if (!me) return;
-    await supabase.from("workspace_members").delete()
+    if (!me || !userId || !workspace) return;
+
+    if (workspace.owner_id === userId) {
+      showToast("Transfer workspace ownership before leaving.", "error");
+      return;
+    }
+
+    const { data: workspaceChannels } = await supabase
+      .from("channels")
+      .select("id")
+      .eq("workspace_id", workspaceId);
+
+    const channelIds = workspaceChannels?.map((c) => c.id) ?? [];
+
+    const { error } = await supabase
+      .from("workspace_members")
+      .delete()
       .eq("workspace_id", workspaceId)
-      .eq("user_id", me.id);
-    await supabase.auth.signOut();
-    router.replace("/auth");
+      .eq("user_id", userId);
+
+    if (error) {
+      showToast("Failed to leave workspace.", "error");
+      return;
+    }
+
+    if (channelIds.length > 0) {
+      await supabase
+        .from("channel_members")
+        .delete()
+        .eq("user_id", userId)
+        .in("channel_id", channelIds);
+    }
+
+    setShowLeaveConfirm(false);
+
+    const { data: anyMembership } = await supabase
+      .from("workspace_members")
+      .select("workspace_id")
+      .eq("user_id", userId)
+      .limit(1)
+      .single();
+
+    if (anyMembership?.workspace_id) {
+      router.replace(`/workspace/${anyMembership.workspace_id}`);
+      return;
+    }
+
+    router.replace("/main/onboarding");
   };
 
   const handleAddWorkspace = async () => {
@@ -3591,11 +4337,7 @@ function WorkspacePage() {
     urgent: { label: 'Urgent', color: '#7c3aed' },
   };
 
-  const isProjectAdmin = useMemo(
-    () => me?.id === activeProject?.created_by ||
-      projectMembers.find((m: any) => m.user_id === me?.id)?.role === 'admin',
-    [me?.id, activeProject?.created_by, projectMembers]
-  );
+
 
   const filteredTasks = useMemo(() => {
     return projectTasks.filter((t) => {
@@ -4946,12 +5688,12 @@ function WorkspacePage() {
                                 <button title="Reply" onClick={() => { setReplyingTo(msg); setOpenMenuMessageId(null); }} style={actionBtn()}>
                                   <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round"><polyline points="9 14 4 9 9 4" /><path d="M20 20v-7a4 4 0 0 0-4-4H4" /></svg>
                                 </button>
-                                {isMe && (
+                                {canEditChannelMessage(msg) && (
                                   <button title="Edit" onClick={() => { setEditingMessageId(msg.id); setEditingContent(msg.content); setOpenMenuMessageId(null); }} style={actionBtn()}>
                                     <Pencil size={14} />
                                   </button>
                                 )}
-                                {(isAdmin) && (
+                                {canPinChannelMessage(msg) && (
                                   <button title={msg.is_pinned ? 'Unpin' : 'Pin'} onClick={() => togglePinMessage(msg)} style={actionBtn(msg.is_pinned ? '#E01E5A' : undefined)}>
                                     <Pin size={14} />
                                   </button>
@@ -4959,7 +5701,7 @@ function WorkspacePage() {
                                 <button title="Mark as unread" onClick={() => markAsUnread(msg)} style={actionBtn()}>
                                   <MailOpen size={14} />
                                 </button>
-                                {isMe && (
+                                {canDeleteChannelMessage(msg) && (
                                   <button title="Delete" onClick={() => deleteMessage(msg.id)} style={actionBtn('#f87171', 'rgba(248,113,113,0.08)')}>
                                     <Trash2 size={14} />
                                   </button>
@@ -4983,190 +5725,203 @@ function WorkspacePage() {
               </div>
 
               {/* Channel input */}
-              <div style={{ padding: "0 20px 20px" }}>
-                <div style={{ border: '1px solid var(--border-color)', borderRadius: 12, backgroundColor: 'var(--bg-input)', overflow: 'hidden' }}>
+              {canAccessActiveChannel ? (
+                <div style={{ padding: "0 20px 20px" }}>
+                  <div style={{ border: '1px solid var(--border-color)', borderRadius: 12, backgroundColor: 'var(--bg-input)', overflow: 'hidden' }}>
 
-                  {/* Formatting toolbar — always visible */}
-                  <FormattingToolbar
-                    textareaEl={editorRef.current}
-                    setter={setNewMessage}
-                  />
-
-                  {/* Reply preview */}
-                  {replyingTo && (
-                    <ReplyPreviewBar
-                      sendername={replyingTo.sender?.full_name ?? 'Unknown'}
-                      content={replyingTo.content}
-                      onCancel={() => setReplyingTo(null)}
+                    {/* Formatting toolbar — always visible */}
+                    <FormattingToolbar
+                      textareaEl={editorRef.current}
+                      setter={setNewMessage}
                     />
-                  )}
 
-                  {/* Editor + send button row */}
-                  <div style={{ display: 'flex', alignItems: 'flex-end', padding: '4px 8px 8px', position: 'relative' }}>
-                    <MentionDropdown editorRef={editorRef} type="channel" />
-
-                    {/* Attachment preview */}
-                    {attachmentFile && (
-                      <div style={{ padding: '6px 12px 0', display: 'flex', alignItems: 'center', gap: 8, width: '100%', position: 'absolute', bottom: '100%', left: 0, backgroundColor: 'var(--bg-input)', borderTop: '1px solid var(--border-color)', zIndex: 5 }}>
-                        {attachmentPreview
-                          ? <img src={attachmentPreview} alt="preview" style={{ width: 44, height: 44, borderRadius: 6, objectFit: 'cover', border: '1px solid var(--border-color)' }} />
-                          : <div style={{ display: 'flex', alignItems: 'center', gap: 7, backgroundColor: 'var(--bg-hover)', borderRadius: 7, padding: '5px 10px', border: '1px solid var(--border-color)' }}>
-                            <Paperclip size={13} color="#E01E5A" />
-                            <span style={{ fontSize: '0.78rem', color: 'var(--text-primary)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{attachmentFile.name}</span>
-                          </div>
-                        }
-                        <button onClick={() => { setAttachmentFile(null); setAttachmentBytes(null); setAttachmentPreview(null); }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 2, display: 'flex', alignItems: 'center' }}><X size={13} /></button>
-                      </div>
+                    {/* Reply preview */}
+                    {replyingTo && (
+                      <ReplyPreviewBar
+                        sendername={replyingTo.sender?.full_name ?? 'Unknown'}
+                        content={replyingTo.content}
+                        onCancel={() => setReplyingTo(null)}
+                      />
                     )}
-                    <input ref={channelFileInputRef} type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv,.zip" style={{ display: 'none' }} onChange={e => { const f = e.target.files?.[0]; if (f) handleAttachPick(f, setAttachmentFile, setAttachmentBytes, setAttachmentPreview, showToast); e.target.value = ''; }} />
 
-                    <button
-                      onClick={() => channelFileInputRef.current?.click()}
-                      style={{ background: 'none', border: 'none', cursor: 'pointer', color: attachmentFile ? "#E01E5A" : "var(--text-muted)", padding: '7px 10px', display: 'flex', alignItems: 'center', transition: 'all 0.15s', flexShrink: 0, marginRight: 4 }}
-                      onMouseEnter={e => e.currentTarget.style.color = "var(--text-primary)"}
-                      onMouseLeave={e => e.currentTarget.style.color = attachmentFile ? "#E01E5A" : "var(--text-muted)"}
-                    >
-                      <Paperclip size={18} />
-                    </button>
+                    {/* Editor + send button row */}
+                    <div style={{ display: 'flex', alignItems: 'flex-end', padding: '4px 8px 8px', position: 'relative' }}>
+                      <MentionDropdown editorRef={editorRef} type="channel" />
 
-                    <div
-                      ref={editorRef}
-                      contentEditable
-                      suppressContentEditableWarning
-                      onInput={() => {
-                        const html = editorRef.current?.innerHTML ?? '';
-                        newMessageRef.current = html;
-                        const isEmpty = !html || html === '<br>';
-                        if (isEmpty !== isNewMessageEmpty) setIsNewMessageEmpty(isEmpty);
+                      {/* Attachment preview */}
+                      {attachmentFile && (
+                        <div style={{ padding: '6px 12px 0', display: 'flex', alignItems: 'center', gap: 8, width: '100%', position: 'absolute', bottom: '100%', left: 0, backgroundColor: 'var(--bg-input)', borderTop: '1px solid var(--border-color)', zIndex: 5 }}>
+                          {attachmentPreview
+                            ? <img src={attachmentPreview} alt="preview" style={{ width: 44, height: 44, borderRadius: 6, objectFit: 'cover', border: '1px solid var(--border-color)' }} />
+                            : <div style={{ display: 'flex', alignItems: 'center', gap: 7, backgroundColor: 'var(--bg-hover)', borderRadius: 7, padding: '5px 10px', border: '1px solid var(--border-color)' }}>
+                              <Paperclip size={13} color="#E01E5A" />
+                              <span style={{ fontSize: '0.78rem', color: 'var(--text-primary)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{attachmentFile.name}</span>
+                            </div>
+                          }
+                          <button onClick={() => { setAttachmentFile(null); setAttachmentBytes(null); setAttachmentPreview(null); }} style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 2, display: 'flex', alignItems: 'center' }}><X size={13} /></button>
+                        </div>
+                      )}
+                      <input ref={channelFileInputRef} type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv,.zip" style={{ display: 'none' }} onChange={e => { const f = e.target.files?.[0]; if (f) handleAttachPick(f, setAttachmentFile, setAttachmentBytes, setAttachmentPreview, showToast); e.target.value = ''; }} />
 
-                        // Mention detection
-                        const sel = window.getSelection();
-                        if (sel && sel.rangeCount > 0) {
-                          const range = sel.getRangeAt(0);
-                          const node = range.startContainer;
-                          if (node.nodeType === Node.TEXT_NODE) {
-                            const text = node.textContent ?? '';
-                            const offset = range.startOffset;
-                            const atIndex = text.lastIndexOf('@', offset);
-                            if (atIndex !== -1 && (atIndex === 0 || /\s/.test(text[atIndex - 1]))) {
-                              const query = text.slice(atIndex + 1, offset);
-                              if (!query.includes(' ')) {
-                                setMentionQuery(query);
-                                setMentionDropdownFor('channel');
-                                setMentionIndex(0);
+                      <button
+                        onClick={() => channelFileInputRef.current?.click()}
+                        style={{ background: 'none', border: 'none', cursor: 'pointer', color: attachmentFile ? "#E01E5A" : "var(--text-muted)", padding: '7px 10px', display: 'flex', alignItems: 'center', transition: 'all 0.15s', flexShrink: 0, marginRight: 4 }}
+                        onMouseEnter={e => e.currentTarget.style.color = "var(--text-primary)"}
+                        onMouseLeave={e => e.currentTarget.style.color = attachmentFile ? "#E01E5A" : "var(--text-muted)"}
+                      >
+                        <Paperclip size={18} />
+                      </button>
 
-                                const editorEl = editorRef.current;
-                                if (editorEl) {
-                                  const rect = editorEl.getBoundingClientRect();
-                                  mentionAnchorRef.current = {
-                                    top: rect.top,
-                                    left: rect.left,
-                                    width: rect.width,
-                                  };
+                      <div
+                        ref={editorRef}
+                        contentEditable
+                        suppressContentEditableWarning
+                        onInput={() => {
+                          const html = editorRef.current?.innerHTML ?? '';
+                          newMessageRef.current = html;
+                          const isEmpty = !html || html === '<br>';
+                          if (isEmpty !== isNewMessageEmpty) setIsNewMessageEmpty(isEmpty);
+
+                          // Mention detection
+                          const sel = window.getSelection();
+                          if (sel && sel.rangeCount > 0) {
+                            const range = sel.getRangeAt(0);
+                            const node = range.startContainer;
+                            if (node.nodeType === Node.TEXT_NODE) {
+                              const text = node.textContent ?? '';
+                              const offset = range.startOffset;
+                              const atIndex = text.lastIndexOf('@', offset);
+                              if (atIndex !== -1 && (atIndex === 0 || /\s/.test(text[atIndex - 1]))) {
+                                const query = text.slice(atIndex + 1, offset);
+                                if (!query.includes(' ')) {
+                                  setMentionQuery(query);
+                                  setMentionDropdownFor('channel');
+                                  setMentionIndex(0);
+
+                                  const editorEl = editorRef.current;
+                                  if (editorEl) {
+                                    const rect = editorEl.getBoundingClientRect();
+                                    mentionAnchorRef.current = {
+                                      top: rect.top,
+                                      left: rect.left,
+                                      width: rect.width,
+                                    };
+                                  }
+                                  return;
                                 }
-                                return;
                               }
                             }
                           }
-                        }
-                        setMentionQuery(null);
-                        setMentionDropdownFor(null);
-                      }}
-                      onKeyDown={(e) => {
-                        // Mention dropdown keyboard nav
-                        if (mentionQuery !== null && mentionDropdownFor === 'channel' && mentionMembers.length > 0) {
-                          if (e.key === 'ArrowDown') {
-                            e.preventDefault();
-                            setMentionIndex(i => Math.min(i + 1, mentionMembers.length - 1));
-                            return;
+                          setMentionQuery(null);
+                          setMentionDropdownFor(null);
+                        }}
+                        onKeyDown={(e) => {
+                          // Mention dropdown keyboard nav
+                          if (mentionQuery !== null && mentionDropdownFor === 'channel' && mentionMembers.length > 0) {
+                            if (e.key === 'ArrowDown') {
+                              e.preventDefault();
+                              setMentionIndex(i => Math.min(i + 1, mentionMembers.length - 1));
+                              return;
+                            }
+                            if (e.key === 'ArrowUp') {
+                              e.preventDefault();
+                              setMentionIndex(i => Math.max(i - 1, 0));
+                              return;
+                            }
+                            if (e.key === 'Enter' || e.key === 'Tab') {
+                              e.preventDefault();
+                              if (editorRef.current) insertMention(mentionMembers[mentionIndex], editorRef.current);
+                              return;
+                            }
+                            if (e.key === 'Escape') {
+                              setMentionQuery(null);
+                              setMentionDropdownFor(null);
+                              return;
+                            }
                           }
-                          if (e.key === 'ArrowUp') {
-                            e.preventDefault();
-                            setMentionIndex(i => Math.max(i - 1, 0));
-                            return;
-                          }
-                          if (e.key === 'Enter' || e.key === 'Tab') {
-                            e.preventDefault();
-                            if (editorRef.current) insertMention(mentionMembers[mentionIndex], editorRef.current);
-                            return;
-                          }
-                          if (e.key === 'Escape') {
-                            setMentionQuery(null);
-                            setMentionDropdownFor(null);
-                            return;
-                          }
-                        }
 
-                        if (e.ctrlKey || e.metaKey) {
-                          if (e.key === 'b') { e.preventDefault(); applyRichFormat('bold', editorRef.current, setNewMessage); return; }
-                          if (e.key === 'i') { e.preventDefault(); applyRichFormat('italic', editorRef.current, setNewMessage); return; }
-                          if (e.key === 'u') { e.preventDefault(); applyRichFormat('underline', editorRef.current, setNewMessage); return; }
-                        }
-                        if (e.key === 'Enter' && !e.shiftKey) {
+                          if (e.ctrlKey || e.metaKey) {
+                            if (e.key === 'b') { e.preventDefault(); applyRichFormat('bold', editorRef.current, setNewMessage); return; }
+                            if (e.key === 'i') { e.preventDefault(); applyRichFormat('italic', editorRef.current, setNewMessage); return; }
+                            if (e.key === 'u') { e.preventDefault(); applyRichFormat('underline', editorRef.current, setNewMessage); return; }
+                          }
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault();
+                            sendMessage();
+                          }
+                        }}
+                        onPaste={(e) => {
                           e.preventDefault();
-                          sendMessage();
-                        }
-                      }}
-                      onPaste={(e) => {
-                        e.preventDefault();
-                        const html = e.clipboardData.getData('text/html');
-                        const plain = e.clipboardData.getData('text/plain');
-                        let cleaned = '';
-                        if (html) {
-                          const tmp = document.createElement('div');
-                          tmp.innerHTML = html;
-                          cleaned = cleanPastedHtml(tmp);
-                        } else {
-                          cleaned = plain.split('\n').map(line => `<div>${line || '<br>'}</div>`).join('');
-                        }
-                        document.execCommand('insertHTML', false, cleaned);
-                        setNewMessage((e.currentTarget as HTMLDivElement).innerHTML);
-                      }}
-                      data-placeholder={`Message ${activeChannel?.name ?? ''}...`}
-                      style={{
-                        flex: 1,
-                        minHeight: 36,
-                        maxHeight: 160,
-                        overflowY: 'auto',
-                        outline: 'none',
-                        color: 'var(--text-primary)',
-                        fontSize: '0.92rem',
-                        lineHeight: 1.6,
-                        wordBreak: 'break-word',
-                        paddingTop: 6,
-                        paddingRight: 6,
-                      }}
-                    />
-                    <button
-                      onClick={sendMessage}
-                      disabled={(!attachmentFile && isNewMessageEmpty) || sending || uploading}
-                      style={{
-                        background: (!isNewMessageEmpty || attachmentFile) ? '#E01E5A' : 'rgba(255,255,255,0.06)',
-                        border: 'none',
-                        borderRadius: 7,
-                        color: (!isNewMessageEmpty || attachmentFile) ? '#fff' : 'var(--text-muted)',
-                        cursor: (!isNewMessageEmpty || attachmentFile) ? 'pointer' : 'not-allowed',
-                        padding: '7px 10px',
-                        display: 'flex',
-                        alignItems: 'center',
-                        transition: 'all 0.15s',
-                        flexShrink: 0,
-                        marginLeft: 6,
-                      }}
-                    >
-                      {sending ? <Loader2 size={16} className="animate-spin" /> : (
-                        <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round">
-                          <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
-                        </svg>
-                      )}
-                    </button>
+                          const html = e.clipboardData.getData('text/html');
+                          const plain = e.clipboardData.getData('text/plain');
+                          let cleaned = '';
+                          if (html) {
+                            const tmp = document.createElement('div');
+                            tmp.innerHTML = html;
+                            cleaned = cleanPastedHtml(tmp);
+                          } else {
+                            cleaned = plain.split('\n').map(line => `<div>${line || '<br>'}</div>`).join('');
+                          }
+                          document.execCommand('insertHTML', false, cleaned);
+                          setNewMessage((e.currentTarget as HTMLDivElement).innerHTML);
+                        }}
+                        data-placeholder={`Message ${activeChannel?.name ?? ''}...`}
+                        style={{
+                          flex: 1,
+                          minHeight: 36,
+                          maxHeight: 160,
+                          overflowY: 'auto',
+                          outline: 'none',
+                          color: 'var(--text-primary)',
+                          fontSize: '0.92rem',
+                          lineHeight: 1.6,
+                          wordBreak: 'break-word',
+                          paddingTop: 6,
+                          paddingRight: 6,
+                        }}
+                      />
+                      <button
+                        onClick={sendMessage}
+                        disabled={(!attachmentFile && isNewMessageEmpty) || sending || uploading}
+                        style={{
+                          background: (!isNewMessageEmpty || attachmentFile) ? '#E01E5A' : 'rgba(255,255,255,0.06)',
+                          border: 'none',
+                          borderRadius: 7,
+                          color: (!isNewMessageEmpty || attachmentFile) ? '#fff' : 'var(--text-muted)',
+                          cursor: (!isNewMessageEmpty || attachmentFile) ? 'pointer' : 'not-allowed',
+                          padding: '7px 10px',
+                          display: 'flex',
+                          alignItems: 'center',
+                          transition: 'all 0.15s',
+                          flexShrink: 0,
+                          marginLeft: 6,
+                        }}
+                      >
+                        {sending ? <Loader2 size={16} className="animate-spin" /> : (
+                          <svg width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round">
+                            <line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" />
+                          </svg>
+                        )}
+                      </button>
+                    </div>
                   </div>
-                </div>
 
-                <p style={{ fontSize: "0.72rem", color: "var(--text-faint)", marginTop: 6, textAlign: "center" }}>
-                  Enter to send · Shift+Enter for new line
-                </p>
-              </div>
+                  <p style={{ fontSize: "0.72rem", color: "var(--text-faint)", marginTop: 6, textAlign: "center" }}>
+                    Enter to send · Shift+Enter for new line
+                  </p>
+                </div>
+              ) : (
+                <div
+                  style={{
+                    padding: "14px 20px",
+                    borderTop: "1px solid var(--border-color)",
+                    color: "var(--text-muted)",
+                    fontSize: "0.88rem",
+                  }}
+                >
+                  You do not have access to send messages in this private channel.
+                </div>
+              )}
             </>
           )}
 
@@ -5289,7 +6044,7 @@ function WorkspacePage() {
                                 <button title="Reply" onClick={() => { setDmReplyingTo({ ...msg, sendername: isMe ? (me?.full_name ?? 'You') : (activeDmUser?.full_name ?? 'User') }); setDmOpenMenuMessageId(null); }} style={actionBtn()}>
                                   <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round"><polyline points="9 14 4 9 9 4" /><path d="M20 20v-7a4 4 0 0 0-4-4H4" /></svg>
                                 </button>
-                                {isMe && (
+                                {canEditDmMessage(msg) && (
                                   <button title="Edit" onClick={() => { setDmEditingMessageId(msg.id); setDmEditingContent(msg.content); setDmOpenMenuMessageId(null); }} style={actionBtn()}>
                                     <Pencil size={14} />
                                   </button>
@@ -5297,7 +6052,7 @@ function WorkspacePage() {
                                 <button title="Mark as unread" onClick={() => markDmAsUnread(msg)} style={actionBtn()}>
                                   <MailOpen size={14} />
                                 </button>
-                                {isMe && (
+                                {canDeleteDmMessage(msg) && (
                                   <button title="Delete" onClick={() => deleteDmMessage(msg.id)} style={actionBtn('#f87171', 'rgba(248,113,113,0.08)')}>
                                     <Trash2 size={14} />
                                   </button>
@@ -5903,7 +6658,7 @@ function WorkspacePage() {
                       </button>
                     ))}
                     <div style={{ flex: 1 }} />
-                    {isAdmin && (
+                    {canManageProject && (
                       <>
                         <button
                           onClick={() => { setNewTaskType('task'); setShowCreateTask(true) }}
@@ -6296,21 +7051,37 @@ function WorkspacePage() {
                                       <button title="Reply" onClick={() => { setProjectReplyingTo(msg); setProjectOpenMenuId(null); }} style={actionBtn()}>
                                         <svg width={14} height={14} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.2} strokeLinecap="round" strokeLinejoin="round"><polyline points="9 14 4 9 9 4" /><path d="M20 20v-7a4 4 0 0 0-4-4H4" /></svg>
                                       </button>
-                                      {isMe && (
-                                        <button title="Edit" onClick={() => { setProjectEditingId(msg.id); setProjectEditingContent(msg.content); setProjectOpenMenuId(null); }} style={actionBtn()}>
+                                      {canEditProjectMessage(msg) && (
+                                        <button
+                                          title="Edit"
+                                          onClick={() => {
+                                            setProjectEditingId(msg.id);
+                                            setProjectEditingContent(msg.content ?? "");
+                                            setProjectOpenMenuId(null);
+                                          }}
+                                          style={actionBtn()}
+                                        >
                                           <Pencil size={14} />
                                         </button>
                                       )}
-                                      {isAdmin && (
-                                        <button title={msg.is_pinned ? 'Unpin' : 'Pin'} onClick={() => togglePinProjectMessage(msg)} style={actionBtn(msg.is_pinned ? '#E01E5A' : undefined)}>
+                                      {canPinProjectMessage(msg) && (
+                                        <button
+                                          title={msg.is_pinned ? 'Unpin' : 'Pin'}
+                                          onClick={() => togglePinProjectMessage(msg)}
+                                          style={actionBtn(msg.is_pinned ? '#E01E5A' : undefined)}
+                                        >
                                           <Pin size={14} />
                                         </button>
                                       )}
                                       <button title="Mark as unread" onClick={() => markProjectMessageAsUnread(msg)} style={actionBtn()}>
                                         <MailOpen size={14} />
                                       </button>
-                                      {isMe && (
-                                        <button title="Delete" onClick={() => deleteProjectChatMessage(msg.id)} style={actionBtn('#f87171', 'rgba(248,113,113,0.08)')}>
+                                      {canDeleteProjectMessage(msg) && (
+                                        <button
+                                          title="Delete"
+                                          onClick={() => deleteProjectChatMessage(msg.id)}
+                                          style={actionBtn('#f87171', 'rgba(248,113,113,0.08)')}
+                                        >
                                           <Trash2 size={14} />
                                         </button>
                                       )}
@@ -6334,140 +7105,153 @@ function WorkspacePage() {
                   </div>
 
                   {/* ── Input Bar ── */}
-                  <div style={{ padding: '0 20px 20px', flexShrink: 0 }}>
-                    <div style={{ border: '1px solid var(--border-color)', borderRadius: 12, backgroundColor: 'var(--bg-input)', overflow: 'hidden' }}>
-                      {/* Formatting toolbar */}
-                      <FormattingToolbar textareaEl={projectEditorRef.current} setter={setProjectNewMessage} />
+                  {canAccessActiveProjectChat ? (
+                    <div style={{ padding: '0 20px 20px', flexShrink: 0 }}>
+                      <div style={{ border: '1px solid var(--border-color)', borderRadius: 12, backgroundColor: 'var(--bg-input)', overflow: 'hidden' }}>
+                        {/* Formatting toolbar */}
+                        <FormattingToolbar textareaEl={projectEditorRef.current} setter={setProjectNewMessage} />
 
-                      {projectReplyingTo && (
-                        <ReplyPreviewBar
-                          sendername={projectReplyingTo.sender?.full_name ?? 'Unknown'}
-                          content={projectReplyingTo.content}
-                          onCancel={() => setProjectReplyingTo(null)}
-                        />
-                      )}
+                        {projectReplyingTo && (
+                          <ReplyPreviewBar
+                            sendername={projectReplyingTo.sender?.full_name ?? 'Unknown'}
+                            content={projectReplyingTo.content}
+                            onCancel={() => setProjectReplyingTo(null)}
+                          />
+                        )}
 
-                      {/* Attachment preview */}
-                      {projectAttachFile && (
-                        <div style={{ padding: '6px 12px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
-                          {projectAttachPreview ? (
-                            <img src={projectAttachPreview} alt="preview" style={{ width: 44, height: 44, borderRadius: 6, objectFit: 'cover', border: '1px solid var(--border-color)' }} />
-                          ) : (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 7, backgroundColor: 'var(--bg-hover)', borderRadius: 7, padding: '5px 10px', border: '1px solid var(--border-color)' }}>
-                              <Paperclip size={13} color="#E01E5A" />
-                              <span style={{ fontSize: '0.78rem', color: 'var(--text-primary)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{projectAttachFile.name}</span>
-                            </div>
-                          )}
-                          <button onClick={() => { setProjectAttachFile(null); setProjectAttachBytes(null); setProjectAttachPreview(null) }}
-                            style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 2, display: 'flex' }}>
-                            <X size={13} />
+                        {/* Attachment preview */}
+                        {projectAttachFile && (
+                          <div style={{ padding: '6px 12px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
+                            {projectAttachPreview ? (
+                              <img src={projectAttachPreview} alt="preview" style={{ width: 44, height: 44, borderRadius: 6, objectFit: 'cover', border: '1px solid var(--border-color)' }} />
+                            ) : (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 7, backgroundColor: 'var(--bg-hover)', borderRadius: 7, padding: '5px 10px', border: '1px solid var(--border-color)' }}>
+                                <Paperclip size={13} color="#E01E5A" />
+                                <span style={{ fontSize: '0.78rem', color: 'var(--text-primary)', maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{projectAttachFile.name}</span>
+                              </div>
+                            )}
+                            <button onClick={() => { setProjectAttachFile(null); setProjectAttachBytes(null); setProjectAttachPreview(null) }}
+                              style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: 2, display: 'flex' }}>
+                              <X size={13} />
+                            </button>
+                          </div>
+                        )}
+
+                        {/* Mention dropdown */}
+                        <MentionDropdown editorRef={projectEditorRef} type="project" />
+
+                        {/* Editor + buttons row */}
+                        <div style={{ display: 'flex', alignItems: 'flex-end', padding: '4px 8px 8px' }}>
+                          {/* Attach */}
+                          <button onClick={() => projectFileInputRef.current?.click()}
+                            style={{ background: 'none', border: 'none', cursor: 'pointer', color: projectAttachFile ? '#E01E5A' : 'var(--text-muted)', padding: '7px 10px', display: 'flex', alignItems: 'center', flexShrink: 0, marginRight: 4 }}>
+                            <Paperclip size={18} />
                           </button>
-                        </div>
-                      )}
+                          <input ref={projectFileInputRef} type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv,.zip" style={{ display: 'none' }}
+                            onChange={e => {
+                              const f = e.target.files?.[0]
+                              if (f) handleAttachPick(f, setProjectAttachFile, setProjectAttachBytes, setProjectAttachPreview, showToast)
+                              e.target.value = ''
+                            }} />
 
-                      {/* Mention dropdown */}
-                      <MentionDropdown editorRef={projectEditorRef} type="project" />
+                          {/* Contenteditable editor */}
+                          <div
+                            ref={projectEditorRef}
+                            contentEditable
+                            suppressContentEditableWarning
+                            data-placeholder={`Message #${activeProject.name}`}
+                            onInput={() => {
+                              const html = projectEditorRef.current?.innerHTML ?? ''
+                              const isEmpty = !html || html === '<br>'
+                              projectNewMessageRef.current = html
+                              if (isEmpty !== isProjectEditorEmpty) setIsProjectEditorEmpty(isEmpty)
 
-                      {/* Editor + buttons row */}
-                      <div style={{ display: 'flex', alignItems: 'flex-end', padding: '4px 8px 8px' }}>
-                        {/* Attach */}
-                        <button onClick={() => projectFileInputRef.current?.click()}
-                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: projectAttachFile ? '#E01E5A' : 'var(--text-muted)', padding: '7px 10px', display: 'flex', alignItems: 'center', flexShrink: 0, marginRight: 4 }}>
-                          <Paperclip size={18} />
-                        </button>
-                        <input ref={projectFileInputRef} type="file" accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt,.csv,.zip" style={{ display: 'none' }}
-                          onChange={e => {
-                            const f = e.target.files?.[0]
-                            if (f) handleAttachPick(f, setProjectAttachFile, setProjectAttachBytes, setProjectAttachPreview, showToast)
-                            e.target.value = ''
-                          }} />
+                              // Mention detection
+                              const sel = window.getSelection();
+                              if (sel && sel.rangeCount > 0) {
+                                const range = sel.getRangeAt(0);
+                                const node = range.startContainer;
+                                if (node.nodeType === Node.TEXT_NODE) {
+                                  const text = node.textContent ?? '';
+                                  const offset = range.startOffset;
+                                  const atIndex = text.lastIndexOf('@', offset);
+                                  if (atIndex !== -1 && (atIndex === 0 || /\s/.test(text[atIndex - 1]))) {
+                                    const query = text.slice(atIndex + 1, offset);
+                                    if (!query.includes(' ')) {
+                                      setMentionQuery(query);
+                                      setMentionDropdownFor('project');
+                                      setMentionIndex(0);
 
-                        {/* Contenteditable editor */}
-                        <div
-                          ref={projectEditorRef}
-                          contentEditable
-                          suppressContentEditableWarning
-                          data-placeholder={`Message #${activeProject.name}`}
-                          onInput={() => {
-                            const html = projectEditorRef.current?.innerHTML ?? ''
-                            const isEmpty = !html || html === '<br>'
-                            projectNewMessageRef.current = html
-                            if (isEmpty !== isProjectEditorEmpty) setIsProjectEditorEmpty(isEmpty)
-
-                            // Mention detection
-                            const sel = window.getSelection();
-                            if (sel && sel.rangeCount > 0) {
-                              const range = sel.getRangeAt(0);
-                              const node = range.startContainer;
-                              if (node.nodeType === Node.TEXT_NODE) {
-                                const text = node.textContent ?? '';
-                                const offset = range.startOffset;
-                                const atIndex = text.lastIndexOf('@', offset);
-                                if (atIndex !== -1 && (atIndex === 0 || /\s/.test(text[atIndex - 1]))) {
-                                  const query = text.slice(atIndex + 1, offset);
-                                  if (!query.includes(' ')) {
-                                    setMentionQuery(query);
-                                    setMentionDropdownFor('project');
-                                    setMentionIndex(0);
-
-                                    const editorEl = projectEditorRef.current;
-                                    if (editorEl) {
-                                      const rect = editorEl.getBoundingClientRect();
-                                      mentionAnchorRef.current = {
-                                        top: rect.top,
-                                        left: rect.left,
-                                        width: rect.width,
-                                      };
+                                      const editorEl = projectEditorRef.current;
+                                      if (editorEl) {
+                                        const rect = editorEl.getBoundingClientRect();
+                                        mentionAnchorRef.current = {
+                                          top: rect.top,
+                                          left: rect.left,
+                                          width: rect.width,
+                                        };
+                                      }
+                                      return;
                                     }
-                                    return;
                                   }
                                 }
                               }
-                            }
-                            setMentionQuery(null);
-                            setMentionDropdownFor(null);
-                          }}
-                          onKeyDown={e => {
-                            // Mention dropdown keyboard nav
-                            if (mentionQuery !== null && mentionDropdownFor === 'project' && mentionMembers.length > 0) {
-                              if (e.key === 'ArrowDown') {
-                                e.preventDefault();
-                                setMentionIndex(i => Math.min(i + 1, mentionMembers.length - 1));
-                                return;
+                              setMentionQuery(null);
+                              setMentionDropdownFor(null);
+                            }}
+                            onKeyDown={e => {
+                              // Mention dropdown keyboard nav
+                              if (mentionQuery !== null && mentionDropdownFor === 'project' && mentionMembers.length > 0) {
+                                if (e.key === 'ArrowDown') {
+                                  e.preventDefault();
+                                  setMentionIndex(i => Math.min(i + 1, mentionMembers.length - 1));
+                                  return;
+                                }
+                                if (e.key === 'ArrowUp') {
+                                  e.preventDefault();
+                                  setMentionIndex(i => Math.max(i - 1, 0));
+                                  return;
+                                }
+                                if (e.key === 'Enter' || e.key === 'Tab') {
+                                  e.preventDefault();
+                                  if (projectEditorRef.current) insertMention(mentionMembers[mentionIndex], projectEditorRef.current);
+                                  return;
+                                }
+                                if (e.key === 'Escape') {
+                                  e.preventDefault();
+                                  setMentionQuery(null);
+                                  setMentionDropdownFor(null);
+                                  return;
+                                }
                               }
-                              if (e.key === 'ArrowUp') {
-                                e.preventDefault();
-                                setMentionIndex(i => Math.max(i - 1, 0));
-                                return;
-                              }
-                              if (e.key === 'Enter' || e.key === 'Tab') {
-                                e.preventDefault();
-                                if (projectEditorRef.current) insertMention(mentionMembers[mentionIndex], projectEditorRef.current);
-                                return;
-                              }
-                              if (e.key === 'Escape') {
-                                e.preventDefault();
-                                setMentionQuery(null);
-                                setMentionDropdownFor(null);
-                                return;
-                              }
-                            }
-                            if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendProjectMessage() }
-                          }}
-                          style={{ flex: 1, minHeight: 36, maxHeight: 180, overflowY: 'auto', outline: 'none', fontSize: '0.9rem', color: 'var(--text-primary)', lineHeight: '1.5', padding: '8px 4px', wordBreak: 'break-word' }}
-                        />
+                              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendProjectMessage() }
+                            }}
+                            style={{ flex: 1, minHeight: 36, maxHeight: 180, overflowY: 'auto', outline: 'none', fontSize: '0.9rem', color: 'var(--text-primary)', lineHeight: '1.5', padding: '8px 4px', wordBreak: 'break-word' }}
+                          />
 
-                        {/* Send button */}
-                        <button onClick={sendProjectMessage}
-                          disabled={projectSending || projectUploading || (isProjectEditorEmpty && !projectAttachFile)}
-                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: (!isProjectEditorEmpty || projectAttachFile) ? '#E01E5A' : 'var(--text-faint)', padding: '7px 10px', display: 'flex', alignItems: 'center', flexShrink: 0, transition: 'color 0.15s' }}>
-                          {projectSending || projectUploading
-                            ? <div style={{ width: 18, height: 18, borderRadius: '50%', border: '2px solid var(--border-strong)', borderTopColor: '#E01E5A', animation: 'spin 0.7s linear infinite' }} />
-                            : <Send size={18} />}
-                        </button>
+                          {/* Send button */}
+                          <button onClick={sendProjectMessage}
+                            disabled={projectSending || projectUploading || (isProjectEditorEmpty && !projectAttachFile)}
+                            style={{ background: 'none', border: 'none', cursor: 'pointer', color: (!isProjectEditorEmpty || projectAttachFile) ? '#E01E5A' : 'var(--text-faint)', padding: '7px 10px', display: 'flex', alignItems: 'center', flexShrink: 0, transition: 'color 0.15s' }}>
+                            {projectSending || projectUploading
+                              ? <div style={{ width: 18, height: 18, borderRadius: '50%', border: '2px solid var(--border-strong)', borderTopColor: '#E01E5A', animation: 'spin 0.7s linear infinite' }} />
+                              : <Send size={18} />}
+                          </button>
+                        </div>
                       </div>
                     </div>
-                  </div>
+                  ) : (
+                    <div
+                      style={{
+                        padding: "14px 20px",
+                        borderTop: "1px solid var(--border-color)",
+                        color: "var(--text-muted)",
+                        fontSize: "0.88rem",
+                      }}
+                    >
+                      You do not have access to send messages in this project.
+                    </div>
+                  )}
                 </div>
               )}
             </div>
@@ -6693,7 +7477,7 @@ function WorkspacePage() {
                   <>
                     <h2 style={{ fontSize: "1.1rem", fontWeight: 700, marginBottom: 4, color: "var(--text-primary)" }}>{me.full_name}</h2>
                     <p style={{ fontSize: "0.85rem", color: "var(--text-secondary)", marginBottom: 4 }}>{me.job_title || <span style={{ fontStyle: "italic", color: "var(--text-muted)" }}>No role set</span>}</p>
-                    <p style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginBottom: 20 }}>{me.email}</p>
+                    <p style={{ fontSize: "0.82rem", color: "var(--text-muted)", marginBottom: 20 }}>{me.email || "No email available"}</p>
                     <button
                       onClick={() => { setEditingProfile(true); setProfileEditName(me.full_name); setProfileEditRole(me.job_title || ""); }}
                       style={{ width: "100%", padding: "10px", borderRadius: 9, border: "1px solid var(--border-color)", backgroundColor: "transparent", color: "var(--text-primary)", fontSize: "0.88rem", fontWeight: 600, cursor: "pointer", transition: "all 0.15s" }}
@@ -7810,7 +8594,7 @@ function WorkspacePage() {
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 5 }}>
                   <div style={{ fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Title</div>
-                  {!editingTitle && (isProjectAdmin || me?.id === activeTask.assignee_id) && (
+                  {!editingTitle && canEditTask && (
                     <button
                       onClick={() => { setEditingTitle(true); setTitleDraft(activeTask.title); }}
                       style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px', display: 'flex' }}
@@ -7850,8 +8634,8 @@ function WorkspacePage() {
                   </div>
                 ) : (
                   <div
-                    onClick={() => { if (isProjectAdmin || me?.id === activeTask.assignee_id) { setEditingTitle(true); setTitleDraft(activeTask.title); } }}
-                    style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-primary)', lineHeight: 1.4, cursor: (isProjectAdmin || me?.id === activeTask.assignee_id) ? 'pointer' : 'default' }}
+                    onClick={() => { if (canEditTask) { setEditingTitle(true); setTitleDraft(activeTask.title); } }}
+                    style={{ fontSize: '1.05rem', fontWeight: 700, color: 'var(--text-primary)', lineHeight: 1.4, cursor: canEditTask ? 'pointer' : 'default' }}
                   >
                     {activeTask.title}
                   </div>
@@ -7936,7 +8720,7 @@ function WorkspacePage() {
               <div>
                 <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
                   <div style={{ fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Description</div>
-                  {!editingDescription && (isProjectAdmin || me?.id === activeTask.assignee_id) && (
+                  {!editingDescription && canEditTask && (
                     <button
                       onClick={() => { setEditingDescription(true); setDescriptionDraft(activeTask.description || ''); }}
                       style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '2px 4px', display: 'flex' }}
@@ -7978,12 +8762,12 @@ function WorkspacePage() {
                   </div>
                 ) : activeTask.description ? (
                   <p
-                    onClick={() => { if (isProjectAdmin || me?.id === activeTask.assignee_id) { setEditingDescription(true); setDescriptionDraft(activeTask.description || ''); } }}
-                    style={{ margin: 0, fontSize: '0.87rem', color: 'var(--text-secondary)', lineHeight: 1.65, whiteSpace: 'pre-wrap', cursor: (isProjectAdmin || me?.id === activeTask.assignee_id) ? 'pointer' : 'default' }}
+                    onClick={() => { if (canEditTask) { setEditingDescription(true); setDescriptionDraft(activeTask.description || ''); } }}
+                    style={{ margin: 0, fontSize: '0.87rem', color: 'var(--text-secondary)', lineHeight: 1.65, whiteSpace: 'pre-wrap', cursor: canEditTask ? 'pointer' : 'default' }}
                   >
                     {activeTask.description}
                   </p>
-                ) : (isProjectAdmin || me?.id === activeTask.assignee_id) ? (
+                ) : canEditTask ? (
                   <button
                     onClick={() => { setEditingDescription(true); setDescriptionDraft(''); }}
                     style={{ display: 'block', width: '100%', textAlign: 'left', padding: '10px 12px', borderRadius: 8, border: '1.5px dashed var(--border-color)', background: 'none', color: 'var(--text-muted)', fontSize: '0.84rem', cursor: 'pointer', fontStyle: 'italic' }}
@@ -8199,8 +8983,8 @@ function WorkspacePage() {
 
 
                   {/* ADMIN: In Review actions */}
-                  {isAdmin && activeTask.status === 'in_review' && (
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {canManageProject && activeTask.status === "in_review" && (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                       {showRevisionInput ? (
                         <>
                           <textarea
@@ -8210,30 +8994,30 @@ function WorkspacePage() {
                             onChange={(e) => setRevisionNote(e.target.value)}
                             rows={3}
                             style={{
-                              width: '100%', padding: '9px 11px', borderRadius: 8, boxSizing: 'border-box',
-                              backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-color)',
-                              color: 'var(--text-primary)', fontSize: '0.84rem', resize: 'vertical', outline: 'none',
+                              width: "100%", padding: "9px 11px", borderRadius: 8, boxSizing: "border-box",
+                              backgroundColor: "var(--bg-input)", border: "1px solid var(--border-color)",
+                              color: "var(--text-primary)", fontSize: "0.84rem", resize: "vertical", outline: "none",
                             }}
                           />
-                          <div style={{ display: 'flex', gap: 7 }}>
-                            <button onClick={() => { setShowRevisionInput(false); setRevisionNote('') }}
-                              style={{ flex: 1, padding: '7px', borderRadius: 7, backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', color: 'var(--text-muted)', cursor: 'pointer', fontWeight: 600, fontSize: '0.8rem' }}>
+                          <div style={{ display: "flex", gap: 7 }}>
+                            <button onClick={() => { setShowRevisionInput(false); setRevisionNote(""); }}
+                              style={{ flex: 1, padding: "7px", borderRadius: 7, backgroundColor: "var(--bg-tertiary)", border: "1px solid var(--border-color)", color: "var(--text-muted)", cursor: "pointer", fontWeight: 600, fontSize: "0.8rem" }}>
                               Cancel
                             </button>
                             <button onClick={requestTaskRevision} disabled={submittingTask || !revisionNote.trim()}
-                              style={{ flex: 2, padding: '7px', borderRadius: 7, backgroundColor: '#ef4444', border: 'none', color: '#fff', cursor: 'pointer', fontWeight: 700, fontSize: '0.8rem' }}>
-                              {submittingTask ? 'Sending…' : '🔄 Request Changes'}
+                              style={{ flex: 2, padding: "7px", borderRadius: 7, backgroundColor: "#ef4444", border: "none", color: "#fff", cursor: "pointer", fontWeight: 700, fontSize: "0.8rem" }}>
+                              {submittingTask ? "Sending…" : "🔄 Request Changes"}
                             </button>
                           </div>
                         </>
                       ) : (
-                        <div style={{ display: 'flex', gap: 7 }}>
+                        <div style={{ display: "flex", gap: 7 }}>
                           <button onClick={() => setShowRevisionInput(true)}
-                            style={{ flex: 1, padding: '8px', borderRadius: 8, backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', color: 'var(--text-muted)', cursor: 'pointer', fontWeight: 600, fontSize: '0.8rem' }}>
+                            style={{ flex: 1, padding: "8px", borderRadius: 8, backgroundColor: "var(--bg-tertiary)", border: "1px solid var(--border-color)", color: "var(--text-muted)", cursor: "pointer", fontWeight: 600, fontSize: "0.8rem" }}>
                             🔄 Request Changes
                           </button>
-                          <button onClick={() => updateTaskStatus(activeTask.id, 'complete')}
-                            style={{ flex: 1, padding: '8px', borderRadius: 8, backgroundColor: '#22c55e', border: 'none', color: '#fff', cursor: 'pointer', fontWeight: 700, fontSize: '0.8rem' }}>
+                          <button onClick={() => updateTaskStatus(activeTask.id, "complete")}
+                            style={{ flex: 1, padding: "8px", borderRadius: 8, backgroundColor: "#22c55e", border: "none", color: "#fff", cursor: "pointer", fontWeight: 700, fontSize: "0.8rem" }}>
                             ✅ Approve & Complete
                           </button>
                         </div>
@@ -8242,9 +9026,9 @@ function WorkspacePage() {
                   )}
 
                   {/* ADMIN: Mark complete on open/active milestone (no assignee path) */}
-                  {isAdmin && !activeTask.assignee_id && ['open', 'active'].includes(activeTask.status) && (
-                    <button onClick={() => updateTaskStatus(activeTask.id, 'complete')}
-                      style={{ padding: '8px', borderRadius: 8, backgroundColor: '#22c55e', border: 'none', color: '#fff', cursor: 'pointer', fontWeight: 700, fontSize: '0.82rem' }}>
+                  {canManageProject && !activeTask.assignee_id && ["open", "active"].includes(activeTask.status) && (
+                    <button onClick={() => updateTaskStatus(activeTask.id, "complete")}
+                      style={{ padding: "8px", borderRadius: 8, backgroundColor: "#22c55e", border: "none", color: "#fff", cursor: "pointer", fontWeight: 700, fontSize: "0.82rem" }}>
                       ✅ Mark Complete
                     </button>
                   )}
@@ -8252,18 +9036,18 @@ function WorkspacePage() {
               )}
 
               {/* TASK: direct complete — only for unassigned tasks (admins only) */}
-              {activeTask.type === 'task' && !activeTask.assignee_id && activeTask.status !== 'complete' && isAdmin && (
-                <button onClick={() => updateTaskStatus(activeTask.id, 'complete')}
-                  style={{ padding: '10px', borderRadius: 9, backgroundColor: '#22c55e', border: 'none', color: '#fff', cursor: 'pointer', fontWeight: 700, fontSize: '0.86rem', marginTop: 'auto' }}>
+              {activeTask.type === "task" && !activeTask.assignee_id && activeTask.status !== "complete" && canManageProject && (
+                <button onClick={() => updateTaskStatus(activeTask.id, "complete")}
+                  style={{ padding: "10px", borderRadius: 9, backgroundColor: "#22c55e", border: "none", color: "#fff", cursor: "pointer", fontWeight: 700, fontSize: "0.86rem", marginTop: "auto" }}>
                   ✅ Mark as Complete
                 </button>
               )}
 
               {/* Delete (admin only) */}
-              {isAdmin && (
+              {canManageProject && (
                 <button onClick={() => deleteProjectTask(activeTask.id)}
-                  style={{ padding: '7px', borderRadius: 8, backgroundColor: 'transparent', border: '1px solid rgba(239,68,68,0.3)', color: '#ef4444', cursor: 'pointer', fontSize: '0.77rem', fontWeight: 600 }}>
-                  Delete {activeTask.type === 'milestone' ? 'Milestone' : 'Task'}
+                  style={{ padding: "7px", borderRadius: 8, backgroundColor: "transparent", border: "1px solid rgba(239,68,68,0.3)", color: "#ef4444", cursor: "pointer", fontSize: "0.77rem", fontWeight: 600 }}>
+                  Delete {activeTask.type === "milestone" ? "Milestone" : "Task"}
                 </button>
               )}
             </div>
@@ -8609,8 +9393,10 @@ function WorkspacePage() {
 
 export default function Page() {
   return (
-    <Suspense fallback={null}>
-      <WorkspacePage />
-    </Suspense>
+    <AuthGuard>
+      <Suspense fallback={null}>
+        <WorkspacePage />
+      </Suspense>
+    </AuthGuard>
   );
 }

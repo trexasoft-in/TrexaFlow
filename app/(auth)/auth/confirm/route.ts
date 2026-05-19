@@ -1,23 +1,14 @@
-import { type EmailOtpType } from '@supabase/supabase-js'
-import { type NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@/utils/supabase/server'
+import type { NextRequest } from "next/server"
+import { NextResponse } from "next/server"
 
 export async function GET(request: NextRequest) {
-  const { searchParams } = new URL(request.url)
-  const token_hash = searchParams.get('token_hash')
-  const type = searchParams.get('type') as EmailOtpType | null
-  const next = searchParams.get('next') ?? '/'
-  const redirectTo = request.nextUrl.clone()
-  redirectTo.pathname = next
+  const centralBase = process.env.NEXT_PUBLIC_CENTRALAUTH_APP_URL?.replace(/\/$/, "")
+  const returnTo = request.nextUrl.searchParams.get("returnTo") || request.nextUrl.origin
 
-  if (token_hash && type) {
-    const supabase = await createClient()
-    const { error } = await supabase.auth.verifyOtp({ type, token_hash })
-    if (!error) {
-      return NextResponse.redirect(redirectTo)
-    }
+  if (!centralBase) {
+    return NextResponse.redirect(new URL("/auth", request.url))
   }
 
-  redirectTo.pathname = '/auth/auth-code-error'
-  return NextResponse.redirect(redirectTo)
+  const target = `${centralBase}/auth/login?returnTo=${encodeURIComponent(returnTo)}`
+  return NextResponse.redirect(target)
 }

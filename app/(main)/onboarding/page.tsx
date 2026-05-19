@@ -1,172 +1,173 @@
-"use client";
+"use client"
 
-import { useEffect, useState, useRef } from "react";
-import { useRouter } from "next/navigation";
-import { User, Briefcase, Upload, X, ArrowRight, Loader2, Plus, LogIn } from "lucide-react";
-import { supabase } from "@/lib/supabase";
-import { useRequireAuth } from "@/lib/useAuth";
+import { useEffect, useState, useRef } from "react"
+import { useRouter } from "next/navigation"
+import { User, Briefcase, Upload, X, ArrowRight, Loader2, Plus, LogIn } from "lucide-react"
+import { supabase } from "@/lib/supabase"
+import { useRequireAuth } from "@/lib/useAuth"
 
-type Step = "profile" | "workspace";
+type Step = "profile" | "workspace"
 
 export default function OnboardingPage() {
-  useRequireAuth();
-  const router = useRouter();
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const wsFileInputRef = useRef<HTMLInputElement>(null);
+  const { user, userId, checking: authChecking } = useRequireAuth()
+  const router = useRouter()
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const wsFileInputRef = useRef<HTMLInputElement>(null)
 
-  const [step, setStep] = useState<Step>("profile");
-  const [loading, setLoading] = useState(false);
-  const [checking, setChecking] = useState(true);
-  const [error, setError] = useState("");
-  const [logoTheme, setLogoTheme] = useState<'light' | 'dark'>('light');
+  const [step, setStep] = useState<Step>("profile")
+  const [loading, setLoading] = useState(false)
+  const [checking, setChecking] = useState(true)
+  const [error, setError] = useState("")
+  const [logoTheme, setLogoTheme] = useState<'light' | 'dark'>('light')
 
   // Handle logo theme sync
   useEffect(() => {
-    const html = document.documentElement;
+    const html = document.documentElement
     const updateLogo = () => {
-      const current = html.getAttribute('data-theme') as 'light' | 'dark' | null;
-      if (current) setLogoTheme(current);
+      const current = html.getAttribute('data-theme') as 'light' | 'dark' | null
+      if (current) setLogoTheme(current)
       else {
         // Fallback to media query if no data-theme
-        setLogoTheme(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+        setLogoTheme(window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
       }
-    };
-    updateLogo();
-    const obs = new MutationObserver(updateLogo);
-    obs.observe(html, { attributes: true, attributeFilter: ['data-theme'] });
-    return () => obs.disconnect();
-  }, []);
+    }
+    updateLogo()
+    const obs = new MutationObserver(updateLogo)
+    obs.observe(html, { attributes: true, attributeFilter: ['data-theme'] })
+    return () => obs.disconnect()
+  }, [])
 
   useEffect(() => {
-    checkAndRedirect();
-  }, []);
+    if (!userId) return
 
-  const checkAndRedirect = async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return router.replace("/auth");
+    const checkAndRedirect = async () => {
+      // If user already has a workspace, skip onboarding entirely
+      const { data: membership } = await supabase
+        .from("workspace_members")
+        .select("workspace_id")
+        .eq("user_id", userId)
+        .limit(1)
+        .single()
 
-    // If user already has a workspace, skip onboarding entirely
-    const { data: membership } = await supabase
-      .from("workspace_members")
-      .select("workspace_id")
-      .eq("user_id", user.id)
-      .limit(1)
-      .single();
+      if (membership) {
+        router.replace(`/workspace/${membership.workspace_id}`)
+        return
+      }
 
-    if (membership) {
-      router.replace(`/workspace/${membership.workspace_id}`);
-      return;
+      // Pre-fill name if profile already exists
+      const { data: profile } = await supabase
+        .from("users")
+        .select("*")
+        .eq("id", userId)
+        .single()
+
+      if (profile?.full_name) {
+        setFullName(profile.full_name)
+        setJobTitle(profile.job_title || "")
+        // Profile done, skip to workspace step
+        setStep("workspace")
+      }
+
+      setChecking(false)
     }
 
-    // Pre-fill name if profile already exists
-    const { data: profile } = await supabase
-      .from("users")
-      .select("*")
-      .eq("id", user.id)
-      .single();
-
-    if (profile?.full_name) {
-      setFullName(profile.full_name);
-      setJobTitle(profile.job_title || "");
-      // Profile done, skip to workspace step
-      setStep("workspace");
-    }
-
-    setChecking(false);
-  };
+    checkAndRedirect()
+  }, [userId, router])
 
   // Profile fields
-  const [fullName, setFullName] = useState("");
-  const [jobTitle, setJobTitle] = useState("");
-  const [avatarFile, setAvatarFile] = useState<File | null>(null);
-  const [avatarPreview, setAvatarPreview] = useState("");
+  const [fullName, setFullName] = useState("")
+  const [jobTitle, setJobTitle] = useState("")
+  const [avatarFile, setAvatarFile] = useState<File | null>(null)
+  const [avatarPreview, setAvatarPreview] = useState("")
 
   // Workspace fields
-  const [wsMode, setWsMode] = useState<"create" | "join">("create");
-  const [wsName, setWsName] = useState("");
-  const [wsDescription, setWsDescription] = useState("");
-  const [wsImageFile, setWsImageFile] = useState<File | null>(null);
-  const [wsImagePreview, setWsImagePreview] = useState("");
-  const [joinId, setJoinId] = useState("");
+  const [wsMode, setWsMode] = useState<"create" | "join">("create")
+  const [wsName, setWsName] = useState("")
+  const [wsDescription, setWsDescription] = useState("")
+  const [wsImageFile, setWsImageFile] = useState<File | null>(null)
+  const [wsImagePreview, setWsImagePreview] = useState("")
+  const [joinId, setJoinId] = useState("")
 
   // ── Image helpers ──
   const handleAvatarChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setAvatarFile(file);
-    setAvatarPreview(URL.createObjectURL(file));
-  };
+    const file = e.target.files?.[0]
+    if (!file) return
+    setAvatarFile(file)
+    setAvatarPreview(URL.createObjectURL(file))
+  }
 
   const handleWsImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setWsImageFile(file);
-    setWsImagePreview(URL.createObjectURL(file));
-  };
+    const file = e.target.files?.[0]
+    if (!file) return
+    setWsImageFile(file)
+    setWsImagePreview(URL.createObjectURL(file))
+  }
 
   // ── Upload file to Supabase Storage ──
   const uploadFile = async (file: File, bucket: string, path: string): Promise<string | null> => {
-    const { error } = await supabase.storage.from(bucket).upload(path, file, { upsert: true });
-    if (error) return null;
-    const { data } = supabase.storage.from(bucket).getPublicUrl(path);
-    return data.publicUrl;
-  };
+    const { error } = await supabase.storage.from(bucket).upload(path, file, { upsert: true })
+    if (error) return null
+    const { data } = supabase.storage.from(bucket).getPublicUrl(path)
+    return data.publicUrl
+  }
 
   // ── Generate short workspace ID ──
   const generateWorkspaceId = () =>
-    Math.random().toString(36).substring(2, 10).toUpperCase();
+    Math.random().toString(36).substring(2, 10).toUpperCase()
 
   // ── Step 1: Save Profile ──
   const handleSaveProfile = async () => {
-    setError("");
-    if (!fullName.trim()) return setError("Please enter your full name.");
-    if (!jobTitle.trim()) return setError("Please enter your job title.");
-    setStep("workspace");
-  };
+    setError("")
+    if (!fullName.trim()) return setError("Please enter your full name.")
+    if (!jobTitle.trim()) return setError("Please enter your job title.")
+    setStep("workspace")
+  }
 
   // ── Step 2: Create or Join Workspace ──
   const handleWorkspace = async () => {
-    setError("");
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) return router.push("/auth");
-
-    setLoading(true);
-
-    // Upload avatar if provided
-    let avatarUrl = "";
-    if (avatarFile) {
-      avatarUrl = await uploadFile(avatarFile, "avatars", `${user.id}/avatar`) || "";
+    if (!userId) {
+      router.replace("/auth")
+      return
     }
 
-    // Save user profile
+    setError("")
+    setLoading(true)
+
+    // Upload avatar if provided
+    let avatarUrl = ""
+    if (avatarFile) {
+      avatarUrl = await uploadFile(avatarFile, "avatars", `${userId}/avatar`) || ""
+    }
+
+    // Save user profile in local Supabase DB
     const { error: profileError } = await supabase.from("users").upsert({
-      id: user.id,
-      email: user.email,
+      id: userId,
+      email: user?.email ?? null,
       full_name: fullName.trim(),
       job_title: jobTitle.trim(),
-      avatar_url: avatarUrl,
-    });
+      avatar_url: avatarUrl || null,
+    })
 
     if (profileError) {
-      setLoading(false);
-      return setError("Failed to save profile. Please try again.");
+      setLoading(false)
+      return setError("Failed to save profile. Please try again.")
     }
 
     if (wsMode === "join") {
       if (!joinId.trim()) {
-        setLoading(false);
-        return setError("Please enter a workspace ID.");
+        setLoading(false)
+        return setError("Please enter a workspace ID.")
       }
 
       const { data: workspace } = await supabase
         .from("workspaces")
         .select("id")
         .eq("workspace_code", joinId.trim().toUpperCase())
-        .single();
+        .single()
 
       if (!workspace) {
-        setLoading(false);
-        return setError("Workspace not found. Please check the ID.");
+        setLoading(false)
+        return setError("Workspace not found. Please check the ID.")
       }
 
       // Check if already a member
@@ -174,32 +175,31 @@ export default function OnboardingPage() {
         .from("workspace_members")
         .select("id")
         .eq("workspace_id", workspace.id)
-        .eq("user_id", user.id)
-        .single();
+        .eq("user_id", userId)
+        .single()
 
       if (!existing) {
         await supabase.from("workspace_members").insert({
           workspace_id: workspace.id,
-          user_id: user.id,
+          user_id: userId,
           role: "member",
-        });
+        })
 
         // Auto-add new member to all public channels in the workspace
         const { data: publicChannels } = await supabase
           .from("channels")
           .select("id")
           .eq("workspace_id", workspace.id)
-          .eq("is_private", false);
+          .eq("is_private", false)
 
         if (publicChannels && publicChannels.length > 0) {
           await supabase.from("channel_members").insert(
             publicChannels.map(ch => ({
               channel_id: ch.id,
-              user_id: user.id,
+              user_id: userId,
             }))
-          );
+          )
         }
-
 
         // Find the Lobby channel
         const { data: lobbyChannel } = await supabase
@@ -207,35 +207,35 @@ export default function OnboardingPage() {
           .select("id")
           .eq("workspace_id", workspace.id)
           .eq("is_default", true)
-          .single();
+          .single()
 
         // Post welcome message in Lobby
         if (lobbyChannel) {
           await supabase.from("messages").insert({
             channel_id: lobbyChannel.id,
-            sender_id: user.id,
+            sender_id: userId,
             content: `👋 **${fullName.trim()}** just joined the workspace. Welcome!`,
             is_pinned: false,
             is_system: true,
-          });
+          })
         }
       }
 
-      setLoading(false);
-      router.push(`/workspace/${workspace.id}`);
+      setLoading(false)
+      router.push(`/workspace/${workspace.id}`)
     } else {
       // Create new workspace
       if (!wsName.trim()) {
-        setLoading(false);
-        return setError("Please enter a workspace name.");
+        setLoading(false)
+        return setError("Please enter a workspace name.")
       }
 
-      let wsImageUrl = "";
+      let wsImageUrl = ""
       if (wsImageFile) {
-        wsImageUrl = await uploadFile(wsImageFile, "workspace-images", `${user.id}/ws-image`) || "";
+        wsImageUrl = await uploadFile(wsImageFile, "workspace-images", `${userId}/ws-image`) || ""
       }
 
-      const workspaceCode = generateWorkspaceId();
+      const workspaceCode = generateWorkspaceId()
 
       const { data: newWorkspace, error: wsError } = await supabase
         .from("workspaces")
@@ -244,22 +244,22 @@ export default function OnboardingPage() {
           description: wsDescription.trim() || null,
           image_url: wsImageUrl || null,
           workspace_code: workspaceCode,
-          owner_id: user.id,
+          owner_id: userId,
         })
         .select()
-        .single();
+        .single()
 
       if (wsError || !newWorkspace) {
-        setLoading(false);
-        return setError("Failed to create workspace. Please try again.");
+        setLoading(false)
+        return setError("Failed to create workspace. Please try again.")
       }
 
       // Add owner as admin member
       await supabase.from("workspace_members").insert({
         workspace_id: newWorkspace.id,
-        user_id: user.id,
+        user_id: userId,
         role: "admin",
-      });
+      })
 
       // Create default Lobby channel
       const { data: lobbyChannel } = await supabase.from("channels").insert({
@@ -267,45 +267,46 @@ export default function OnboardingPage() {
         name: "lobby",
         description: "Welcome to the workspace!",
         is_private: false,
-        created_by: user.id,
+        created_by: userId,
         is_default: true,
-      }).select().single();
+      }).select().single()
 
       // Post welcome message in Lobby
       if (lobbyChannel) {
         // Add creator to lobby channel_members
         await supabase.from("channel_members").insert({
           channel_id: lobbyChannel.id,
-          user_id: user.id,
-        });
+          user_id: userId,
+        })
 
         await supabase.from("messages").insert({
           channel_id: lobbyChannel.id,
-          sender_id: user.id,
+          sender_id: userId,
           content: `👋 **${fullName.trim()}** created this workspace. Welcome!`,
           is_pinned: false,
           is_system: true,
-        });
+        })
       }
 
-
-      setLoading(false);
-      router.push(`/workspace/${newWorkspace.id}`);
+      setLoading(false)
+      router.push(`/workspace/${newWorkspace.id}`)
     }
-  };
+  }
+
+  const isChecking = authChecking || checking
 
   // ─────────────────────────────────────────────
-  if (checking) return (
+  if (isChecking) return (
     <div style={{ minHeight: "100vh", backgroundColor: "var(--bg-primary)", display: "flex", alignItems: "center", justifyContent: "center" }}>
       <Loader2 size={28} color="var(--accent)" className="animate-spin" />
     </div>
-  );
+  )
 
   if (loading) return (
     <div style={{ minHeight: "100vh", backgroundColor: "var(--bg-primary)", display: "flex", alignItems: "center", justifyContent: "center" }}>
       <Loader2 size={28} color="var(--accent)" className="animate-spin" />
     </div>
-  );
+  )
 
   return (
     <div style={{
@@ -326,8 +327,8 @@ export default function OnboardingPage() {
       {/* Step indicator */}
       <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "32px" }}>
         {["Profile", "Workspace"].map((label, i) => {
-          const isActive = (i === 0 && step === "profile") || (i === 1 && step === "workspace");
-          const isDone = i === 0 && step === "workspace";
+          const isActive = (i === 0 && step === "profile") || (i === 1 && step === "workspace")
+          const isDone = i === 0 && step === "workspace"
           return (
             <div key={i} style={{ display: "flex", alignItems: "center", gap: "8px" }}>
               <div style={{ display: "flex", alignItems: "center", gap: "7px" }}>
@@ -348,7 +349,7 @@ export default function OnboardingPage() {
                 <div style={{ width: 32, height: 1, backgroundColor: step === "workspace" ? "var(--border-strong)" : "var(--border-color)", margin: "0 4px" }} />
               )}
             </div>
-          );
+          )
         })}
       </div>
 
@@ -593,8 +594,8 @@ export default function OnboardingPage() {
               opacity: loading ? 0.7 : 1,
               display: "flex", alignItems: "center", justifyContent: "center", gap: "8px",
             }}
-              onMouseEnter={e => { if (!loading) e.currentTarget.style.backgroundColor = "var(--accent-hover)"; }}
-              onMouseLeave={e => { e.currentTarget.style.backgroundColor = "var(--accent)"; }}
+              onMouseEnter={e => { if (!loading) e.currentTarget.style.backgroundColor = "var(--accent-hover)" }}
+              onMouseLeave={e => { e.currentTarget.style.backgroundColor = "var(--accent)" }}
             >
               {loading && <Loader2 size={17} className="animate-spin" />}
               {wsMode === "create"
@@ -603,7 +604,7 @@ export default function OnboardingPage() {
               }
             </button>
 
-            <button onClick={() => { setStep("profile"); setError(""); }} style={{
+            <button onClick={() => { setStep("profile"); setError("") }} style={{
               width: "100%", marginTop: "12px", padding: "10px",
               background: "none", border: "none", color: "var(--text-muted)",
               fontSize: "0.83rem", cursor: "pointer",
@@ -614,5 +615,5 @@ export default function OnboardingPage() {
         )}
       </div>
     </div>
-  );
+  )
 }
