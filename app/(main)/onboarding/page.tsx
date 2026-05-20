@@ -232,7 +232,7 @@ export default function OnboardingPage() {
 
       let wsImageUrl = ""
       if (wsImageFile) {
-        wsImageUrl = await uploadFile(wsImageFile, "workspace-images", `${userId}/ws-image`) || ""
+        wsImageUrl = await uploadFile(wsImageFile, "workspace-images", `${userId}/ws-image-${Date.now()}`) || ""
       }
 
       const workspaceCode = generateWorkspaceId()

@@ -27,28 +27,62 @@ function safeParse<T>(value: string | null): T | null {
 
 export function getSession(): CentralSession | null {
   if (typeof window === "undefined") return null
-  return safeParse<CentralSession>(localStorage.getItem(SESSION_KEY))
+  try {
+    const val = localStorage.getItem(SESSION_KEY)
+    if (val) return safeParse<CentralSession>(val)
+  } catch {}
+  try {
+    return safeParse<CentralSession>(sessionStorage.getItem(SESSION_KEY))
+  } catch {
+    return null
+  }
 }
 
 export function setSession(session: CentralSession) {
   if (typeof window === "undefined") return
-  localStorage.setItem(SESSION_KEY, JSON.stringify(session))
+  try {
+    localStorage.setItem(SESSION_KEY, JSON.stringify(session))
+  } catch {
+    try {
+      sessionStorage.setItem(SESSION_KEY, JSON.stringify(session))
+    } catch {}
+  }
 }
 
 export function clearSession() {
   if (typeof window === "undefined") return
-  localStorage.removeItem(SESSION_KEY)
-  localStorage.removeItem(REFRESH_KEY)
+  try {
+    localStorage.removeItem(SESSION_KEY)
+    localStorage.removeItem(REFRESH_KEY)
+  } catch {}
+  try {
+    sessionStorage.removeItem(SESSION_KEY)
+    sessionStorage.removeItem(REFRESH_KEY)
+  } catch {}
 }
 
 export function getRefreshToken(): string | null {
   if (typeof window === "undefined") return null
-  return localStorage.getItem(REFRESH_KEY)
+  try {
+    const val = localStorage.getItem(REFRESH_KEY)
+    if (val) return val
+  } catch {}
+  try {
+    return sessionStorage.getItem(REFRESH_KEY)
+  } catch {
+    return null
+  }
 }
 
 export function setRefreshToken(token: string) {
   if (typeof window === "undefined") return
-  localStorage.setItem(REFRESH_KEY, token)
+  try {
+    localStorage.setItem(REFRESH_KEY, token)
+  } catch {
+    try {
+      sessionStorage.setItem(REFRESH_KEY, token)
+    } catch {}
+  }
 }
 
 export function decodeJwt(token: string): Record<string, unknown> | null {
@@ -86,13 +120,18 @@ export function bootstrapCentralAuthSession(): CentralSession | null {
 
   if (!accessToken || !userId) return null
 
+  // Fallback: if email or name is missing from redirect query params, attempt to extract them from the JWT access token.
+  const decoded = decodeJwt(accessToken)
+  const finalEmail = email || (decoded?.email as string) || undefined
+  const finalName = name || (decoded?.name as string) || (decoded?.fullname as string) || undefined
+
   const session: CentralSession = {
     accessToken,
     user: {
       userid: userId,
-      email,
-      name,
-      fullname: name,
+      email: finalEmail,
+      name: finalName,
+      fullname: finalName,
       avatarurl,
     },
   }

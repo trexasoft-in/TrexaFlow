@@ -256,7 +256,7 @@ export default function LandingPage() {
     // Listen for system theme changes if no override is set
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
     const handleSystemChange = () => {
-      const saved = localStorage.getItem('trexaflow_theme');
+      const saved = localStorage.getItem('trexaflow-theme');
       if (!saved || (saved !== 'light' && saved !== 'dark')) {
         document.documentElement.setAttribute('data-theme', mediaQuery.matches ? 'dark' : 'light');
       }
@@ -294,7 +294,7 @@ export default function LandingPage() {
     const current = document.documentElement.getAttribute('data-theme');
     const next = current === 'dark' ? 'light' : 'dark';
     document.documentElement.setAttribute('data-theme', next);
-    localStorage.setItem('trexaflow_theme', next);
+    localStorage.setItem('trexaflow-theme', next);
   };
 
   const featureSections = [

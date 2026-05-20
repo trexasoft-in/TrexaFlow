@@ -1,6 +1,20 @@
 import { createBrowserClient } from '@supabase/ssr'
+import { getSession } from './auth'
+import { env } from './env'
 
 export const supabase = createBrowserClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  env.supabaseUrl,
+  env.supabaseAnonKey,
+  {
+    global: {
+      fetch: (url, options = {}) => {
+        const session = getSession()
+        const headers = new Headers((options as RequestInit).headers)
+        if (session?.accessToken) {
+          headers.set('Authorization', `Bearer ${session.accessToken}`)
+        }
+        return fetch(url, { ...options, headers })
+      }
+    }
+  }
 )

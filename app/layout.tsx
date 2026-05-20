@@ -13,7 +13,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <script dangerouslySetInnerHTML={{ __html: `
           (function() {
             try {
-              var saved = localStorage.getItem('trexaflow_theme');
+              var saved = localStorage.getItem('trexaflow-theme');
               var theme = saved;
               if (!theme || (theme !== 'dark' && theme !== 'light')) {
                 // If no saved theme, detect system preference

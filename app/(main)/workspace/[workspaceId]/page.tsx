@@ -400,6 +400,8 @@ function WorkspacePage() {
   const [members, setMembers] = useState<Member[]>([]);
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [hasMoreMessages, setHasMoreMessages] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [newMessage, setNewMessage] = useState("");
   const [sending, setSending] = useState(false);
   const [attachmentFile, setAttachmentFile] = useState<File | null>(null);
@@ -532,7 +534,124 @@ function WorkspacePage() {
   // Task detail panel
   const [activeTask, setActiveTask] = useState<ProjectTask | null>(null);
   const [showTaskPanel, setShowTaskPanel] = useState(false);
+  const [taskComments, setTaskComments] = useState<any[]>([]);
+  const [taskSubtasks, setTaskSubtasks] = useState<any[]>([]);
+  const [newCommentText, setNewCommentText] = useState('');
+  const [sendingComment, setSendingComment] = useState(false);
   const [taskFilter, setTaskFilter] = useState<'all' | 'task' | 'milestone' | TaskStatus>('all');
+
+  const touchStartX = useRef<number | null>(null);
+
+  const onTaskPanelTouchStart = (e: React.TouchEvent) => {
+    touchStartX.current = e.changedTouches[0].clientX;
+  };
+
+  const onTaskPanelTouchEnd = (e: React.TouchEvent) => {
+    if (touchStartX.current == null) return;
+    const deltaX = e.changedTouches[0].clientX - touchStartX.current;
+    if (deltaX > 80) {
+      setShowTaskPanel(false);
+      setActiveTask(null);
+    }
+    touchStartX.current = null;
+  };
+
+  useEffect(() => {
+    if (!activeTask) return;
+    const fresh = projectTasks.find(t => t.id === activeTask.id);
+    if (!fresh) {
+      setActiveTask(null);
+      setShowTaskPanel(false);
+      return;
+    }
+    setActiveTask(prev => (prev ? { ...prev, ...fresh } : fresh));
+  }, [projectTasks, activeTask?.id]);
+
+  const loadTaskDetails = async (taskId: string) => {
+    const [{ data: comments }, { data: subtasks }] = await Promise.all([
+      supabase
+        .from('task_comments')
+        .select('*, sender:users(*)')
+        .eq('task_id', taskId)
+        .order('created_at'),
+      supabase
+        .from('subtasks')
+        .select('*')
+        .eq('task_id', taskId)
+        .order('position'),
+    ]);
+    setTaskComments(comments ?? []);
+    setTaskSubtasks(subtasks ?? []);
+  };
+
+  const sendTaskComment = async () => {
+    if (!activeTask || !me || !newCommentText.trim()) return;
+    setSendingComment(true);
+    const { data, error } = await supabase
+      .from('task_comments')
+      .insert({
+        task_id: activeTask.id,
+        sender_id: me.id,
+        content: newCommentText.trim(),
+      })
+      .select('*, sender:users(*)')
+      .single();
+    if (!error && data) {
+      setTaskComments(prev => [...prev, data]);
+      setNewCommentText('');
+    } else {
+      showToast('Failed to send comment.', 'error');
+    }
+    setSendingComment(false);
+  };
+
+  const deleteTaskComment = async (commentId: string) => {
+    const comment = taskComments.find(c => c.id === commentId);
+    if (!comment) return;
+    if (comment.sender_id !== me?.id && !canManageProject) {
+      showToast('You can only delete your own comments.', 'error');
+      return;
+    }
+    await supabase.from('task_comments').delete().eq('id', commentId);
+    setTaskComments(prev => prev.filter(c => c.id !== commentId));
+  };
+
+  const createSubtask = async (title: string) => {
+    if (!activeTask || !me || !title.trim()) return;
+    const { data, error } = await supabase
+      .from('subtasks')
+      .insert({
+        task_id: activeTask.id,
+        title: title.trim(),
+        created_by: me.id,
+        is_complete: false,
+        position: taskSubtasks.length,
+      })
+      .select()
+      .single();
+    if (!error && data) setTaskSubtasks(prev => [...prev, data]);
+    else showToast('Failed to create subtask.', 'error');
+  };
+
+  const toggleSubtask = async (subtaskId: string, current: boolean) => {
+    const { error } = await supabase
+      .from('subtasks')
+      .update({ is_complete: !current, updated_at: new Date().toISOString() })
+      .eq('id', subtaskId);
+    if (!error)
+      setTaskSubtasks(prev =>
+        prev.map(s => s.id === subtaskId ? { ...s, is_complete: !current } : s)
+      );
+  };
+
+  const deleteSubtask = async (subtaskId: string) => {
+    if (!canManageProject) {
+      showToast('Only project admins can delete subtasks.', 'error');
+      return;
+    }
+    await supabase.from('subtasks').delete().eq('id', subtaskId);
+    setTaskSubtasks(prev => prev.filter(s => s.id !== subtaskId));
+  };
 
   // Create task/milestone modal
   const [showCreateTask, setShowCreateTask] = useState(false);
@@ -670,6 +789,11 @@ function WorkspacePage() {
     let cleanup: (() => void) | undefined;
     init(userId).then(fn => { cleanup = fn as (() => void) | undefined; });
     return () => {
+      if (presenceChannelRef.current) {
+        presenceChannelRef.current.untrack();
+        supabase.removeChannel(presenceChannelRef.current);
+        presenceChannelRef.current = null;
+      }
       cleanup?.();
       if (dmSubRef.current) { supabase.removeChannel(dmSubRef.current); dmSubRef.current = null; }
       if (allDmSubRef.current) { supabase.removeChannel(allDmSubRef.current); allDmSubRef.current = null; }
@@ -713,9 +837,50 @@ function WorkspacePage() {
     };
   }, []);
 
+  // Realtime subscription for active task comments and subtasks
+  useEffect(() => {
+    if (!showTaskPanel || !activeTask?.id) return;
+
+    const taskCommentSub = supabase
+      .channel(`task-comments-${activeTask.id}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'task_comments',
+        filter: `task_id=eq.${activeTask.id}`
+      }, () => {
+        loadTaskDetails(activeTask.id);
+      })
+      .subscribe();
+
+    const subtasksSub = supabase
+      .channel(`task-subtasks-${activeTask.id}`)
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'subtasks',
+        filter: `task_id=eq.${activeTask.id}`
+      }, () => {
+        loadTaskDetails(activeTask.id);
+      })
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(taskCommentSub);
+      supabase.removeChannel(subtasksSub);
+    };
+  }, [showTaskPanel, activeTask?.id]);
+
+  // When task panel opens:
+  useEffect(() => {
+    if (showTaskPanel && activeTask?.id) {
+      loadTaskDetails(activeTask.id);
+    }
+  }, [showTaskPanel, activeTask?.id]);
+
   // Theme init
   useEffect(() => {
-    const saved = localStorage.getItem("trexaflow_theme") as ThemeMode;
+    const saved = localStorage.getItem("trexaflow-theme") as ThemeMode;
     const mode = saved ?? "light";
     setThemeMode(mode);
     // Do NOT call applyTheme(mode) here as it's handled by the layout script
@@ -1036,21 +1201,10 @@ function WorkspacePage() {
   const loadProjectMembers = async (projectId: string) => {
     const { data: pms } = await supabase
       .from("project_members")
-      .select("*")
+      .select("*, profile:users(*)")
       .eq("project_id", projectId);
-    if (!pms) {
-      setProjectMembers([]);
-      setNonProjectMembers(members);
-      return;
-    }
-    const withProfiles = await Promise.all(
-      pms.map(async (pm: any) => {
-        const { data: p } = await supabase.from("users").select("*").eq("id", pm.user_id).single();
-        return { ...pm, profile: p };
-      })
-    );
-    setProjectMembers(withProfiles);
-    const memberIds = withProfiles.map((pm: any) => pm.user_id);
+    setProjectMembers(pms ?? []);
+    const memberIds = (pms ?? []).map((pm: any) => pm.user_id);
     setNonProjectMembers(members.filter(m => !memberIds.includes(m.user_id)));
   };
 
@@ -1377,7 +1531,7 @@ function WorkspacePage() {
 
   // Send project message
   const sendProjectMessage = async () => {
-    const optimisticId = `temp-${Date.now()}`;
+    const optimisticId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const editorEl = projectEditorRef.current;
 
     if (!editorEl || !me || !activeProject || projectSending || projectUploading) return;
@@ -1637,7 +1791,7 @@ function WorkspacePage() {
     setLoadingTasks(true);
     const { data } = await supabase
       .from('tasks')
-      .select('*, assignee:users!tasks_assignee_id_fkey(*)')
+      .select('*, assignee:users(id, full_name, avatar_url, job_title)')
       .eq('project_id', projectId)
       .order('created_at', { ascending: false });
     setProjectTasks((data as ProjectTask[]) ?? []);
@@ -1857,6 +2011,11 @@ function WorkspacePage() {
       return;
     }
 
+    if (task.type === 'milestone' && newStatus === 'complete' && task.status !== 'in_review') {
+      showToast('Milestone must be submitted and reviewed before marking complete.', 'error');
+      return;
+    }
+
     const updates: Record<string, any> = {
       status: newStatus,
       updated_at: new Date().toISOString(),
@@ -2041,7 +2200,8 @@ function WorkspacePage() {
 
   // ─── init ────────────────────────────────────────────────
   const init = async (currentUserId: string) => {
-    meIdRef.current = currentUserId;
+    try {
+      meIdRef.current = currentUserId;
 
     const { data: profile } = await supabase
       .from("users").select("*").eq("id", currentUserId).single();
@@ -2062,13 +2222,14 @@ function WorkspacePage() {
       .single();
 
     if (!membership) {
-      const { data: anyMembership } = await supabase
+      const { data: anyMemberships } = await supabase
         .from("workspace_members")
         .select("workspace_id")
         .eq("user_id", currentUserId)
-        .limit(1)
-        .single();
-      if (anyMembership) return router.replace(`/workspace/${anyMembership.workspace_id}`);
+        .limit(1);
+      if (anyMemberships && anyMemberships.length > 0) {
+        return router.replace(`/workspace/${anyMemberships[0].workspace_id}`);
+      }
       return router.replace("/main/onboarding");
     }
 
@@ -2491,12 +2652,17 @@ function WorkspacePage() {
       })
       .subscribe();
 
-    return () => {
-      supabase.removeChannel(msgSub);
-      supabase.removeChannel(chanRealtime);
-      supabase.removeChannel(memberJoinSub);
-      supabase.removeChannel(projectsRealtime);
-    };
+      return () => {
+        supabase.removeChannel(msgSub);
+        supabase.removeChannel(chanRealtime);
+        supabase.removeChannel(memberJoinSub);
+        supabase.removeChannel(projectsRealtime);
+      };
+    } catch (err) {
+      console.error('Workspace init failed:', err);
+      showToast('Failed to load workspace. Please refresh.', 'error');
+      setLoading(false);
+    }
   };
 
   // ─── Load channel messages ────────────────────────────────
@@ -2527,9 +2693,34 @@ function WorkspacePage() {
       .from("messages")
       .select("*, sender:users(*)")
       .eq("channel_id", channelId)
-      .order("created_at");
+      .order("created_at", { ascending: false })
+      .limit(50);
 
-    setMessages(data ?? []);
+    const reversed = (data ?? []).reverse();
+    setMessages(reversed);
+    setHasMoreMessages((data ?? []).length === 50);
+  };
+
+  const loadEarlierMessages = async () => {
+    if (!activeChannel || loadingEarlier) return;
+    setLoadingEarlier(true);
+
+    const offset = messages.length;
+    const { data } = await supabase
+      .from("messages")
+      .select("*, sender:users(*)")
+      .eq("channel_id", activeChannel.id)
+      .order("created_at", { ascending: false })
+      .range(offset, offset + 49);
+
+    if (data && data.length > 0) {
+      const reversed = [...data].reverse();
+      setMessages(prev => [...reversed, ...prev]);
+      setHasMoreMessages(data.length === 50);
+    } else {
+      setHasMoreMessages(false);
+    }
+    setLoadingEarlier(false);
   };
 
   // ─── Switch active channel ────────────────────────────────
@@ -2654,7 +2845,7 @@ function WorkspacePage() {
   const canAccessActiveProjectChat =
     !!activeProject &&
     !!me &&
-    (!activeProject.is_private || !!myProjectMembership);
+    (!activeProject.is_private || loadingTasks || !!myProjectMembership);
 
   const canModerateProjectMessage = (msg: ProjectMessage) =>
     !!me && (msg.sender_id === me.id || canManageProject);
@@ -2804,8 +2995,9 @@ function WorkspacePage() {
     setAttachmentBytes(null);
     setAttachmentPreview(null);
 
+    const optimisticId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const optimisticMsg: Message = {
-      id: `temp-${Date.now()}`,
+      id: optimisticId,
       channel_id: activeChannel.id,
       content,
       created_at: new Date().toISOString(),
@@ -2913,10 +3105,12 @@ function WorkspacePage() {
       setDmAttachmentPreview(null);
     }
 
+    const optimisticId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
     const optimisticMsg: DM = {
-      id: `temp-${Date.now()}`,
+      id: optimisticId,
       sender_id: me.id,
       receiver_id: activeDmUserId,
+      workspace_id: workspaceId,
       content,
       created_at: new Date().toISOString(),
       attachment_url: attachData?.url ?? null,
@@ -3351,7 +3545,7 @@ function WorkspacePage() {
   const handleThemeChange = (mode: ThemeMode) => {
     setThemeMode(mode);
     applyTheme(mode);
-    localStorage.setItem("trexaflow_theme", mode);
+    localStorage.setItem("trexaflow-theme", mode);
     setShowThemePicker(false);
   };
 
@@ -3664,6 +3858,32 @@ function WorkspacePage() {
     showToast(`Role updated to ${newRole === "admin" ? "Admin" : "Member"}.`, "success");
   };
 
+  const changeMemberRole = updateWorkspaceMemberRole;
+
+  const changeProjectMemberRole = async (targetUserId: string, newRole: 'admin' | 'member') => {
+    if (!canManageProject) {
+      showToast('You do not have permission to change project roles.', 'error');
+      return;
+    }
+    if (targetUserId === activeProject?.created_by) {
+      showToast('The project creator role cannot be changed.', 'error');
+      return;
+    }
+    const { error } = await supabase
+      .from('project_members')
+      .update({ role: newRole })
+      .eq('project_id', activeProject!.id)
+      .eq('user_id', targetUserId);
+    if (error) {
+      showToast('Failed to change role.', 'error');
+      return;
+    }
+    setProjectMembers(prev =>
+      prev.map(m => m.user_id === targetUserId ? { ...m, role: newRole } : m)
+    );
+    showToast(`Project role updated to ${newRole}.`, 'success');
+  };
+
   // ─── Remove workspace member ──────────────────────────────
   const removeWorkspaceMember = async (targetUserId: string) => {
     if (!workspace || !me) return;
@@ -3709,6 +3929,21 @@ function WorkspacePage() {
         .in("channel_id", channelIds);
     }
 
+    const { data: wsProjects } = await supabase
+      .from('projects')
+      .select('id')
+      .eq('workspace_id', workspaceId);
+
+    const projectIds = wsProjects?.map(p => p.id) ?? [];
+
+    if (projectIds.length > 0) {
+      await supabase
+        .from('project_members')
+        .delete()
+        .eq('user_id', targetUserId)
+        .in('project_id', projectIds);
+    }
+
     setMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
     setChannelMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
     setNonChannelMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
@@ -3750,6 +3985,21 @@ function WorkspacePage() {
         .delete()
         .eq("user_id", userId)
         .in("channel_id", channelIds);
+    }
+
+    const { data: wsProjects } = await supabase
+      .from('projects')
+      .select('id')
+      .eq('workspace_id', workspaceId);
+
+    const projectIds = wsProjects?.map(p => p.id) ?? [];
+
+    if (projectIds.length > 0) {
+      await supabase
+        .from('project_members')
+        .delete()
+        .eq('user_id', userId)
+        .in('project_id', projectIds);
     }
 
     setShowLeaveConfirm(false);
@@ -3796,6 +4046,17 @@ function WorkspacePage() {
         .single();
 
       if (!existing) {
+        const { data: profile } = await supabase
+          .from('users')
+          .select('id')
+          .eq('id', me.id)
+          .single();
+
+        if (!profile) {
+          router.replace('/main/onboarding');
+          return;
+        }
+
         await supabase.from('workspace_members').insert({ workspace_id: ws.id, user_id: me.id, role: 'member' });
         // Auto-join public channels
         const { data: pubChans } = await supabase.from('channels').select('id').eq('workspace_id', ws.id).eq('is_private', false);
@@ -4462,17 +4723,20 @@ function WorkspacePage() {
       ),
     };
     return (
-      <div style={{
-        position: 'fixed', bottom: 28, left: '50%', transform: 'translateX(-50%)',
-        zIndex: 99999, display: 'flex', alignItems: 'center', gap: 10,
-        backgroundColor: c.bg,
-        border: `1px solid ${c.border}`,
-        backdropFilter: 'blur(12px)',
-        borderRadius: 12, padding: '12px 18px',
-        boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
-        maxWidth: 420, minWidth: 260,
-        animation: 'toastIn 0.25s cubic-bezier(0.16,1,0.3,1)',
-      }}>
+      <div
+        role={toast.type === 'error' ? 'alert' : 'status'}
+        aria-live={toast.type === 'error' ? 'assertive' : 'polite'}
+        style={{
+          position: 'fixed', bottom: 28, left: '50%', transform: 'translateX(-50%)',
+          zIndex: 99999, display: 'flex', alignItems: 'center', gap: 10,
+          backgroundColor: c.bg,
+          border: `1px solid ${c.border}`,
+          backdropFilter: 'blur(12px)',
+          borderRadius: 12, padding: '12px 18px',
+          boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+          maxWidth: 420, minWidth: 260,
+          animation: 'toastIn 0.25s cubic-bezier(0.16,1,0.3,1)',
+        }}>
         <div style={{ flexShrink: 0 }}>{icons[toast.type]}</div>
         <span style={{ fontSize: '0.85rem', color: 'var(--text-primary)', lineHeight: 1.45, flex: 1 }}>
           {toast.message}
@@ -5565,6 +5829,46 @@ function WorkspacePage() {
                         <WorkspaceInfoModal />
                       </div>
                     </div>
+                  </div>
+                )}
+
+                {/* Load earlier messages button */}
+                {hasMoreMessages && (
+                  <div style={{ display: 'flex', justifyContent: 'center', margin: '12px 0' }}>
+                    <button
+                      onClick={loadEarlierMessages}
+                      disabled={loadingEarlier}
+                      style={{
+                        padding: '6px 14px',
+                        borderRadius: 8,
+                        fontSize: '0.78rem',
+                        fontWeight: 600,
+                        backgroundColor: 'var(--bg-secondary)',
+                        border: '1px solid var(--border-color)',
+                        color: 'var(--text-secondary)',
+                        cursor: 'pointer',
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 6,
+                        transition: 'all 0.15s'
+                      }}
+                      onMouseEnter={e => {
+                        e.currentTarget.style.backgroundColor = 'var(--bg-hover)';
+                        e.currentTarget.style.color = 'var(--text-primary)';
+                      }}
+                      onMouseLeave={e => {
+                        e.currentTarget.style.backgroundColor = 'var(--bg-secondary)';
+                        e.currentTarget.style.color = 'var(--text-secondary)';
+                      }}
+                    >
+                      {loadingEarlier ? (
+                        <>
+                          <Loader2 size={13} className="animate-spin" /> Loading earlier messages...
+                        </>
+                      ) : (
+                        'Load earlier messages'
+                      )}
+                    </button>
                   </div>
                 )}
 
@@ -7884,7 +8188,23 @@ function WorkspacePage() {
                         <Avatar profile={pm.profile} size={28} />
                         <div style={{ flex: 1 }}>
                           <div style={{ fontSize: "0.85rem", fontWeight: 600, color: "var(--text-primary)" }}>{pm.profile?.full_name}</div>
-                          <div style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>{pm.role}</div>
+                          {canManageProject && pm.user_id !== activeProject?.created_by ? (
+                            <select
+                              value={pm.role}
+                              onChange={e => changeProjectMemberRole(pm.user_id, e.target.value as 'admin' | 'member')}
+                              style={{
+                                border: 'none', background: 'transparent', color: 'var(--text-muted)',
+                                fontSize: '0.72rem', cursor: 'pointer', outline: 'none', padding: 0
+                              }}
+                            >
+                              <option value="admin" style={{ backgroundColor: 'var(--bg-secondary)', color: 'var(--text-primary)' }}>Admin</option>
+                              <option value="member" style={{ backgroundColor: 'var(--bg-secondary)', color: 'var(--text-primary)' }}>Member</option>
+                            </select>
+                          ) : (
+                            <div style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>
+                              {pm.role === 'admin' ? 'Admin' : 'Member'}
+                            </div>
+                          )}
                         </div>
                         {pm.user_id !== me?.id && (
                           <button onClick={() => removeProjectMember(pm.user_id)}
@@ -8540,12 +8860,15 @@ function WorkspacePage() {
             onClick={() => { setShowTaskPanel(false); setShowRevisionInput(false) }}
             style={{ position: 'absolute', inset: 0, backgroundColor: 'rgba(0,0,0,0.4)' }}
           />
-          <div style={{
-            position: 'relative', zIndex: 91, width: 480, maxWidth: '95vw',
-            backgroundColor: 'var(--bg-secondary)', height: '100%',
-            overflowY: 'auto', boxShadow: '-4px 0 32px rgba(0,0,0,0.3)',
-            display: 'flex', flexDirection: 'column',
-          }}>
+          <div
+            onTouchStart={onTaskPanelTouchStart}
+            onTouchEnd={onTaskPanelTouchEnd}
+            style={{
+              position: 'relative', zIndex: 91, width: 480, maxWidth: '95vw',
+              backgroundColor: 'var(--bg-secondary)', height: '100%',
+              overflowY: 'auto', boxShadow: '-4px 0 32px rgba(0,0,0,0.3)',
+              display: 'flex', flexDirection: 'column',
+            }}>
             {/* Header */}
             <div style={{
               padding: '18px 22px 14px', borderBottom: '1px solid var(--border-color)',
@@ -9042,6 +9365,144 @@ function WorkspacePage() {
                   ✅ Mark as Complete
                 </button>
               )}
+
+              {/* Subtasks Section */}
+              <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: 16 }}>
+                <div style={{ fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.06em', marginBottom: 10, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>Subtasks</span>
+                  <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>
+                    {taskSubtasks.filter(s => s.is_complete).length}/{taskSubtasks.length}
+                  </span>
+                </div>
+                
+                {/* Subtask input */}
+                <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
+                  <input
+                    type="text"
+                    placeholder="Add a subtask..."
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') {
+                        createSubtask(e.currentTarget.value);
+                        e.currentTarget.value = '';
+                      }
+                    }}
+                    style={{
+                      flex: 1, padding: '6px 10px', borderRadius: 6,
+                      backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-color)',
+                      color: 'var(--text-primary)', fontSize: '0.78rem', outline: 'none'
+                    }}
+                  />
+                </div>
+
+                {/* Subtasks list */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {taskSubtasks.map(subtask => (
+                    <div key={subtask.id} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '4px 0' }}>
+                      <input
+                        type="checkbox"
+                        checked={subtask.is_complete}
+                        onChange={() => toggleSubtask(subtask.id, subtask.is_complete)}
+                        style={{ cursor: 'pointer', width: 14, height: 14 }}
+                      />
+                      <span style={{
+                        flex: 1, fontSize: '0.8rem',
+                        color: subtask.is_complete ? 'var(--text-muted)' : 'var(--text-primary)',
+                        textDecoration: subtask.is_complete ? 'line-through' : 'none'
+                      }}>
+                        {subtask.title}
+                      </span>
+                      {canManageProject && (
+                        <button
+                          onClick={() => deleteSubtask(subtask.id)}
+                          style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ef4444', padding: '2px 4px' }}
+                        >
+                          <Trash2 size={12} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  {taskSubtasks.length === 0 && (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-faint)', fontStyle: 'italic' }}>
+                      No subtasks added yet.
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Comments Section */}
+              <div style={{ borderTop: '1px solid var(--border-color)', paddingTop: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div style={{ fontSize: '0.68rem', fontWeight: 700, color: 'var(--text-faint)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>
+                  Comments ({taskComments.length})
+                </div>
+
+                {/* New Comment Input */}
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input
+                    type="text"
+                    placeholder="Add a comment..."
+                    value={newCommentText}
+                    onChange={e => setNewCommentText(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') sendTaskComment();
+                    }}
+                    style={{
+                      flex: 1, padding: '7px 11px', borderRadius: 8,
+                      backgroundColor: 'var(--bg-input)', border: '1px solid var(--border-color)',
+                      color: 'var(--text-primary)', fontSize: '0.8rem', outline: 'none'
+                    }}
+                  />
+                  <button
+                    onClick={sendTaskComment}
+                    disabled={sendingComment || !newCommentText.trim()}
+                    style={{
+                      padding: '0 12px', borderRadius: 8, border: 'none',
+                      backgroundColor: newCommentText.trim() ? '#E01E5A' : 'var(--bg-tertiary)',
+                      color: newCommentText.trim() ? '#fff' : 'var(--text-faint)',
+                      cursor: newCommentText.trim() ? 'pointer' : 'not-allowed',
+                      fontSize: '0.76rem', fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center'
+                    }}
+                  >
+                    Send
+                  </button>
+                </div>
+
+                {/* Comments List */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                  {taskComments.map(comment => (
+                    <div key={comment.id} style={{ display: 'flex', gap: 10 }}>
+                      <Avatar profile={comment.sender} size={28} />
+                      <div style={{ flex: 1, minWidth: 0, backgroundColor: 'var(--bg-tertiary)', padding: '8px 10px', borderRadius: 8 }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 3 }}>
+                          <span style={{ fontSize: '0.75rem', fontWeight: 700, color: 'var(--text-primary)' }}>
+                            {comment.sender?.full_name ?? 'Unknown User'}
+                          </span>
+                          <span style={{ fontSize: '0.65rem', color: 'var(--text-faint)' }}>
+                            {new Date(comment.created_at).toLocaleDateString([], { month: 'short', day: 'numeric' })} at {new Date(comment.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </span>
+                        </div>
+                        <p style={{ margin: 0, fontSize: '0.78rem', color: 'var(--text-primary)', whiteSpace: 'pre-wrap' }}>
+                          {comment.content}
+                        </p>
+                        {(comment.sender_id === me?.id || canManageProject) && (
+                          <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
+                            <button
+                              onClick={() => deleteTaskComment(comment.id)}
+                              style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#ef4444', fontSize: '0.65rem', padding: 0 }}
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                  {taskComments.length === 0 && (
+                    <div style={{ fontSize: '0.75rem', color: 'var(--text-faint)', fontStyle: 'italic', textAlign: 'center', padding: '8px 0' }}>
+                      No comments yet.
+                    </div>
+                  )}
+                </div>
+              </div>
 
               {/* Delete (admin only) */}
               {canManageProject && (

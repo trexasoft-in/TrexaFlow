@@ -1,49 +1,11 @@
 "use client"
 
 import axios from "axios"
-import { clearSession, getRefreshToken, getSession, setSession } from "@/lib/auth"
-import { getCentralAuthApiBase, goToCentralLogin } from "@/lib/centralAuth"
-import { useAuthStore } from "@/store/useAuthStore"
+import { getSession } from "@/lib/auth"
+import { refreshSessionShared } from "@/lib/refreshSession"
+import { safeRedirectToLogin } from "@/lib/authRedirect"
 
 const api = axios.create()
-
-let refreshing: Promise<string | null> | null = null
-
-async function refreshAccessToken(): Promise<string | null> {
-  if (refreshing) return refreshing
-
-  refreshing = (async () => {
-    const refreshToken = getRefreshToken()
-    const stored = getSession()
-    const base = getCentralAuthApiBase()
-
-    if (!refreshToken || !stored?.user || !base) return null
-
-    try {
-      const { data } = await axios.post(`${base}/api/auth/refresh`, {
-        refreshtoken: refreshToken,
-      })
-
-      const nextToken = data?.accesstoken || data?.accessToken
-      if (!nextToken) return null
-
-      const nextSession = {
-        accessToken: nextToken,
-        user: stored.user,
-      }
-
-      setSession(nextSession)
-      useAuthStore.getState().setSession(nextSession)
-      return nextToken
-    } catch {
-      return null
-    } finally {
-      refreshing = null
-    }
-  })()
-
-  return refreshing
-}
 
 api.interceptors.request.use(async (config) => {
   const stored = getSession()
@@ -64,19 +26,15 @@ api.interceptors.response.use(
     }
 
     original._retry = true
-    const newToken = await refreshAccessToken()
+    const session = await refreshSessionShared()
 
-    if (!newToken) {
-      clearSession()
-      useAuthStore.getState().clearSession()
-      if (typeof window !== "undefined") {
-        goToCentralLogin(window.location.href)
-      }
+    if (!session?.accessToken) {
+      safeRedirectToLogin()
       return Promise.reject(error)
     }
 
     original.headers = original.headers || {}
-    original.headers.Authorization = `Bearer ${newToken}`
+    original.headers.Authorization = `Bearer ${session.accessToken}`
     return api(original)
   }
 )
