@@ -292,10 +292,16 @@ export default function LandingPage() {
   const postAuthReturnTo = `${window.location.origin}/main/onboarding`;
 
   const toggleTheme = () => {
+    if (typeof window === 'undefined' || typeof document === 'undefined') return;
+
     const current = document.documentElement.getAttribute('data-theme');
     const next = current === 'dark' ? 'light' : 'dark';
+
     document.documentElement.setAttribute('data-theme', next);
-    localStorage.setItem('trexaflow-theme', next);
+
+    try {
+      window.localStorage.setItem('trexaflow-theme', next);
+    } catch {}
   };
 
   const featureSections = [
