@@ -289,7 +289,7 @@ export default function LandingPage() {
     };
     run();
   }, [router]);
-  const postAuthReturnTo = `${window.location.origin}/main/onboarding`;
+  // const postAuthReturnTo = `${window.location.origin}/main/onboarding`;
 
   const toggleTheme = () => {
     if (typeof window === 'undefined' || typeof document === 'undefined') return;
