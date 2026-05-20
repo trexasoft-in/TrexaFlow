@@ -21,14 +21,14 @@ export async function refreshSessionShared(): Promise<CentralSession | null> {
     if (!refreshToken || !stored?.user || !base) return null;
 
     try {
-      const { data } = await axios.post(`${base}/api/auth/refresh`, {
-        refreshtoken: refreshToken,
+      const { data } = await axios.post(`${base}/auth/refresh`, {
+        refreshToken,
       });
 
-      const nextToken = data?.accesstoken || data?.accessToken;
+      const nextToken = data?.accessToken ?? data?.accesstoken;
       if (!nextToken) return null;
 
-      const nextSession = {
+      const nextSession: CentralSession = {
         accessToken: nextToken,
         user: stored.user,
       };
