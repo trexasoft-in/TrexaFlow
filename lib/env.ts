@@ -9,18 +9,17 @@ const required = {
 
 for (const [key, value] of Object.entries(required)) {
   if (!value) {
-    // Only throw if in client or explicit dev/prod runtime to prevent build-time crashes if optional
-    if (typeof window !== 'undefined' || process.env.NODE_ENV !== 'production') {
+    if (typeof window !== "undefined" || process.env.NODE_ENV !== "production") {
       throw new Error(`Missing required env: ${key}`);
     }
   }
 }
 
 export const env = {
-  supabaseUrl: required.NEXT_PUBLIC_SUPABASE_URL || "",
-  supabaseAnonKey: required.NEXT_PUBLIC_SUPABASE_ANON_KEY || "",
-  centralAuthAppUrl: (required.NEXT_PUBLIC_CENTRALAUTH_APP_URL || "").replace(/\/$/, ''),
-  centralAuthApiUrl: (required.NEXT_PUBLIC_CENTRALAUTH_API_URL || "").replace(/\/$/, ''),
-  cloudinaryCloudName: required.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME || "",
-  cloudinaryUploadPreset: required.NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET || "",
+  supabaseUrl: required.NEXT_PUBLIC_SUPABASE_URL!,
+  supabaseAnonKey: required.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+  centralAuthAppUrl: required.NEXT_PUBLIC_CENTRALAUTH_APP_URL!.replace(/\/$/, ""),
+  centralAuthApiUrl: required.NEXT_PUBLIC_CENTRALAUTH_API_URL!.replace(/\/$/, ""),
+  cloudinaryCloudName: required.NEXT_PUBLIC_CLOUDINARY_CLOUD_NAME!,
+  cloudinaryUploadPreset: required.NEXT_PUBLIC_CLOUDINARY_UPLOAD_PRESET!,
 };

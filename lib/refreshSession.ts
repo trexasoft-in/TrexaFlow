@@ -2,6 +2,7 @@ import axios from "axios";
 import { getRefreshToken, getSession, setSession, setRefreshToken } from "@/lib/auth";
 import { useAuthStore } from "@/store/useAuthStore";
 import { env } from "@/lib/env";
+import { supabase } from "@/lib/supabase";
 
 type CentralSession = {
   accessToken: string;
@@ -38,7 +39,6 @@ export async function refreshSessionShared(): Promise<CentralSession | null> {
       useAuthStore.getState().setSession(nextSession);
 
       try {
-        const { supabase } = await import("@/lib/supabase");
         supabase.realtime.setAuth(nextToken);
       } catch {}
 
