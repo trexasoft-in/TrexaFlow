@@ -9,8 +9,10 @@ function AuthPageInner() {
   const params = useSearchParams()
 
   useEffect(() => {
+    const origin = window.location.origin
+    const returnTo = params.get("returnTo") ?? `${origin}/main/onboarding`
+
     const mode = params.get("mode")
-    const returnTo = params.get("returnTo") || window.location.origin
 
     if (mode === "signup") {
       goToCentralSignup(returnTo)

@@ -13,46 +13,54 @@ import { useAuthStore } from "@/store/useAuthStore"
 import { refreshSessionShared } from "@/lib/refreshSession"
 
 export function useAuthBootstrap() {
-  const setStoreSession = useAuthStore((s) => s.setSession)
-  const clearStoreSession = useAuthStore((s) => s.clearSession)
-  const setHydrated = useAuthStore((s) => s.setHydrated)
+  const setStoreSession = useAuthStore((s) => s.setSession);
+  const clearStoreSession = useAuthStore((s) => s.clearSession);
+  const setHydrated = useAuthStore((s) => s.setHydrated);
 
   useEffect(() => {
-    let mounted = true
+    let mounted = true;
+
+    const applyRealtimeAuth = async (token: string) => {
+      const { supabase } = await import('./supabase');
+      supabase.realtime.setAuth(token);
+    };
 
     const init = async () => {
-      const fromUrl = bootstrapCentralAuthSession()
+      const fromUrl = bootstrapCentralAuthSession();
       if (fromUrl?.accessToken && fromUrl?.user) {
-        if (!mounted) return
-        setStoreSession(fromUrl)
-        return
+        if (!mounted) return;
+        setStoreSession(fromUrl);
+        await applyRealtimeAuth(fromUrl.accessToken);
+        return;
       }
 
-      const stored = getSession()
+      const stored = getSession();
       if (stored?.accessToken && stored?.user && !isTokenExpired(stored.accessToken)) {
-        if (!mounted) return
-        setStoreSession(stored)
-        return
+        if (!mounted) return;
+        setStoreSession(stored);
+        await applyRealtimeAuth(stored.accessToken);
+        return;
       }
 
-      const refreshed = await refreshSessionShared()
+      const refreshed = await refreshSessionShared();
       if (refreshed?.accessToken && refreshed?.user) {
-        if (!mounted) return
-        setStoreSession(refreshed)
-        return
+        if (!mounted) return;
+        setStoreSession(refreshed);
+        await applyRealtimeAuth(refreshed.accessToken);
+        return;
       }
 
-      clearSession()
-      if (!mounted) return
-      clearStoreSession()
-      setHydrated(true)
-    }
+      clearSession();
+      if (!mounted) return;
+      clearStoreSession();
+      setHydrated(true);
+    };
 
-    init()
+    init();
     return () => {
-      mounted = false
-    }
-  }, [setStoreSession, clearStoreSession, setHydrated])
+      mounted = false;
+    };
+  }, [setStoreSession, clearStoreSession, setHydrated]);
 }
 
 export function useRequireAuth() {

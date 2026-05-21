@@ -105,37 +105,49 @@ export function isTokenExpired(token?: string | null) {
 }
 
 export function bootstrapCentralAuthSession(): CentralSession | null {
-  if (typeof window === "undefined") return null
+  if (typeof window === 'undefined') return null;
 
-  const url = new URL(window.location.href)
-  const accessToken = url.searchParams.get("accesstoken") || url.searchParams.get("accessToken")
-  const refreshToken = url.searchParams.get("refreshtoken") || url.searchParams.get("refreshToken")
-  const qpUserId = url.searchParams.get("userid") || url.searchParams.get("userId")
-  const email = url.searchParams.get("email") || undefined
+  const url = new URL(window.location.href);
+
+  const accessToken =
+    url.searchParams.get('accesstoken') ||
+    url.searchParams.get('accessToken');
+
+  const refreshToken =
+    url.searchParams.get('refreshtoken') ||
+    url.searchParams.get('refreshToken');
+
+  const queryUserId =
+    url.searchParams.get('userid') ||
+    url.searchParams.get('userId');
+
+  const email = url.searchParams.get('email') || undefined;
   const name =
-    url.searchParams.get("name") ||
-    url.searchParams.get("fullname") ||
-    undefined
-  const avatarurl = url.searchParams.get("avatarurl") || undefined
+    url.searchParams.get('name') ||
+    url.searchParams.get('fullname') ||
+    undefined;
+  const avatarurl = url.searchParams.get('avatarurl') || undefined;
 
-  if (!accessToken) return null
+  if (!accessToken) return null;
 
-  const decoded = decodeJwt(accessToken)
-  const jwtUserId =
-    (decoded?.userid as string) ||
-    (decoded?.userId as string) ||
-    (decoded?.sub as string) ||
-    null
+  const decoded = decodeJwt(accessToken) ?? {};
 
-  const userId = qpUserId || jwtUserId
-  if (!userId) return null
+  const tokenUserId =
+    (typeof decoded.sub === 'string' && decoded.sub) ||
+    (typeof decoded.userid === 'string' && decoded.userid) ||
+    (typeof decoded.userId === 'string' && decoded.userId) ||
+    null;
 
-  const finalEmail = email || (decoded?.email as string) || undefined
+  const userId = queryUserId || tokenUserId;
+  if (!userId) return null;
+
+  const finalEmail =
+    email || (typeof decoded.email === 'string' ? decoded.email : undefined);
+
   const finalName =
     name ||
-    (decoded?.name as string) ||
-    (decoded?.fullname as string) ||
-    undefined
+    (typeof decoded.name === 'string' ? decoded.name : undefined) ||
+    (typeof decoded.fullname === 'string' ? decoded.fullname : undefined);
 
   const session: CentralSession = {
     accessToken,
@@ -146,24 +158,24 @@ export function bootstrapCentralAuthSession(): CentralSession | null {
       fullname: finalName,
       avatarurl,
     },
-  }
+  };
 
-  setSession(session)
-  if (refreshToken) setRefreshToken(refreshToken)
+  setSession(session);
+  if (refreshToken) setRefreshToken(refreshToken);
 
-  ;[
-    "accesstoken",
-    "accessToken",
-    "refreshtoken",
-    "refreshToken",
-    "userid",
-    "userId",
-    "email",
-    "name",
-    "fullname",
-    "avatarurl",
-  ].forEach((key) => url.searchParams.delete(key))
+  [
+    'accesstoken',
+    'accessToken',
+    'refreshtoken',
+    'refreshToken',
+    'userid',
+    'userId',
+    'email',
+    'name',
+    'fullname',
+    'avatarurl',
+  ].forEach((key) => url.searchParams.delete(key));
 
-  window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`)
-  return session
+  window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+  return session;
 }

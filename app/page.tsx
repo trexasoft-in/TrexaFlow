@@ -31,10 +31,12 @@ import {
   Play,
   Sparkles,
   TrendingUp,
+  Loader2,
 } from 'lucide-react';
 import { supabase } from '@/lib/supabase';
 import { getSession, isTokenExpired } from '@/lib/auth';
 import { goToCentralLogin, goToCentralSignup } from '@/lib/centralAuth';
+import { useRedirectIfAuthed } from '@/lib/useAuth';
 
 // ─── Scroll reveal hook ───────────────────────────────────────────────────────
 function useReveal() {
@@ -221,7 +223,7 @@ function SectionHeading({ eyebrow, title, sub }: { eyebrow: string; title: strin
 }
 
 // ─── Main page ────────────────────────────────────────────────────────────────
-export default function LandingPage() {
+function LandingContent() {
   const router = useRouter();
   const [navScrolled, setNavScrolled] = useState(false);
   const [logoTheme, setLogoTheme] = useState<'light' | 'dark'>('dark');
@@ -391,7 +393,7 @@ export default function LandingPage() {
 
             {!isMobile && (
               <button
-                onClick={() => goToCentralLogin('/main/onboarding')}
+                onClick={() => goToCentralLogin(window.location.origin + '/main/onboarding')}
                 style={{ background: 'transparent', border: 'none', color: 'var(--text-secondary)', fontSize: '0.875rem', fontWeight: 500, cursor: 'pointer', padding: '7px 16px', borderRadius: 8, transition: 'color 0.15s' }}
                 onMouseEnter={e => (e.currentTarget.style.color = 'var(--text-primary)')}
                 onMouseLeave={e => (e.currentTarget.style.color = 'var(--text-secondary)')}
@@ -401,7 +403,7 @@ export default function LandingPage() {
             )}
             
             <button
-              onClick={() => goToCentralSignup('/main/onboarding')}
+              onClick={() => goToCentralSignup(window.location.origin + '/main/onboarding')}
               style={{ 
                 backgroundColor: '#E01E5A', color: '#fff', border: 'none', 
                 fontSize: '0.875rem', fontWeight: 600, cursor: 'pointer', 
@@ -456,7 +458,7 @@ export default function LandingPage() {
 
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, justifyContent: 'center', marginBottom: 20 }}>
             <button
-              onClick={() => goToCentralSignup('/main/onboarding')}
+              onClick={() => goToCentralSignup(window.location.origin + '/main/onboarding')}
               style={{ display: 'flex', alignItems: 'center', gap: 8, backgroundColor: '#E01E5A', color: '#fff', border: 'none', fontSize: '0.97rem', fontWeight: 700, cursor: 'pointer', padding: '13px 30px', borderRadius: 11, boxShadow: '0 0 36px rgba(224,30,90,0.28)', transition: 'background 0.15s, transform 0.15s' }}
               onMouseEnter={e => { (e.currentTarget as HTMLElement).style.backgroundColor = '#c8174f'; (e.currentTarget as HTMLElement).style.transform = 'translateY(-1px)'; }}
               onMouseLeave={e => { (e.currentTarget as HTMLElement).style.backgroundColor = '#E01E5A'; (e.currentTarget as HTMLElement).style.transform = 'translateY(0)'; }}
@@ -785,7 +787,7 @@ export default function LandingPage() {
                 </p>
                 <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, justifyContent: 'center' }}>
                   <button
-                    onClick={() => goToCentralSignup('/main/onboarding')}
+                    onClick={() => goToCentralSignup(window.location.origin + '/main/onboarding')}
                     style={{ display: 'flex', alignItems: 'center', gap: 8, backgroundColor: '#E01E5A', color: '#fff', border: 'none', fontSize: '0.97rem', fontWeight: 700, cursor: 'pointer', padding: '13px 30px', borderRadius: 11, boxShadow: '0 0 40px rgba(224,30,90,0.3)', transition: 'background 0.15s, transform 0.15s' }}
                     onMouseEnter={e => { (e.currentTarget as HTMLElement).style.backgroundColor = '#c8174f'; (e.currentTarget as HTMLElement).style.transform = 'translateY(-1px)'; }}
                     onMouseLeave={e => { (e.currentTarget as HTMLElement).style.backgroundColor = '#E01E5A'; (e.currentTarget as HTMLElement).style.transform = 'translateY(0)'; }}
@@ -793,7 +795,7 @@ export default function LandingPage() {
                     Get Started Free <ArrowRight size={16} />
                   </button>
                   <button
-                    onClick={() => goToCentralSignup('/main/onboarding')}
+                    onClick={() => goToCentralSignup(window.location.origin + '/main/onboarding')}
                     style={{ display: 'flex', alignItems: 'center', gap: 8, backgroundColor: 'var(--bg-tertiary)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', fontSize: '0.97rem', fontWeight: 600, cursor: 'pointer', padding: '13px 26px', borderRadius: 11, transition: 'all 0.15s' }}
                     onMouseEnter={e => { (e.currentTarget as HTMLElement).style.color = 'var(--text-primary)'; }}
                     onMouseLeave={e => { (e.currentTarget as HTMLElement).style.color = 'var(--text-secondary)'; }}
@@ -823,4 +825,18 @@ export default function LandingPage() {
 
     </div>
   );
+}
+
+export default function HomePage() {
+  const { checking } = useRedirectIfAuthed();
+
+  if (checking) {
+    return (
+      <div className="min-h-screen flex items-center justify-center">
+        <Loader2 className="h-5 w-5 animate-spin" />
+      </div>
+    );
+  }
+
+  return <LandingContent />;
 }

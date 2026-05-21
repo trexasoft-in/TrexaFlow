@@ -6,7 +6,7 @@ const csp = [
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' blob: data: https://*.supabase.co https://res.cloudinary.com",
   "media-src 'self' https://res.cloudinary.com",
-  "connect-src 'self' https://*.supabase.co wss://*.supabase.co https://api.cloudinary.com https://res.cloudinary.com",
+  `connect-src 'self' https://*.supabase.co wss://*.supabase.co https://api.cloudinary.com https://res.cloudinary.com ${process.env.NEXT_PUBLIC_CENTRALAUTH_API_URL || ""}`.trim(),
   "font-src 'self'",
   "frame-src 'none'",
   "object-src 'none'",
