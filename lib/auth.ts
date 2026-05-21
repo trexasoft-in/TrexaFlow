@@ -110,7 +110,7 @@ export function bootstrapCentralAuthSession(): CentralSession | null {
   const url = new URL(window.location.href)
   const accessToken = url.searchParams.get("accesstoken") || url.searchParams.get("accessToken")
   const refreshToken = url.searchParams.get("refreshtoken") || url.searchParams.get("refreshToken")
-  const userId = url.searchParams.get("userid") || url.searchParams.get("userId")
+  const qpUserId = url.searchParams.get("userid") || url.searchParams.get("userId")
   const email = url.searchParams.get("email") || undefined
   const name =
     url.searchParams.get("name") ||
@@ -118,12 +118,24 @@ export function bootstrapCentralAuthSession(): CentralSession | null {
     undefined
   const avatarurl = url.searchParams.get("avatarurl") || undefined
 
-  if (!accessToken || !userId) return null
+  if (!accessToken) return null
 
-  // Fallback: if email or name is missing from redirect query params, attempt to extract them from the JWT access token.
   const decoded = decodeJwt(accessToken)
+  const jwtUserId =
+    (decoded?.userid as string) ||
+    (decoded?.userId as string) ||
+    (decoded?.sub as string) ||
+    null
+
+  const userId = qpUserId || jwtUserId
+  if (!userId) return null
+
   const finalEmail = email || (decoded?.email as string) || undefined
-  const finalName = name || (decoded?.name as string) || (decoded?.fullname as string) || undefined
+  const finalName =
+    name ||
+    (decoded?.name as string) ||
+    (decoded?.fullname as string) ||
+    undefined
 
   const session: CentralSession = {
     accessToken,
