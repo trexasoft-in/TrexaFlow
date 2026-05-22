@@ -30,7 +30,7 @@ export function getSession(): CentralSession | null {
   try {
     const val = localStorage.getItem(SESSION_KEY)
     if (val) return safeParse<CentralSession>(val)
-  } catch {}
+  } catch { }
   try {
     return safeParse<CentralSession>(sessionStorage.getItem(SESSION_KEY))
   } catch {
@@ -45,7 +45,7 @@ export function setSession(session: CentralSession) {
   } catch {
     try {
       sessionStorage.setItem(SESSION_KEY, JSON.stringify(session))
-    } catch {}
+    } catch { }
   }
 }
 
@@ -54,11 +54,11 @@ export function clearSession() {
   try {
     localStorage.removeItem(SESSION_KEY)
     localStorage.removeItem(REFRESH_KEY)
-  } catch {}
+  } catch { }
   try {
     sessionStorage.removeItem(SESSION_KEY)
     sessionStorage.removeItem(REFRESH_KEY)
-  } catch {}
+  } catch { }
 }
 
 export function getRefreshToken(): string | null {
@@ -66,7 +66,7 @@ export function getRefreshToken(): string | null {
   try {
     const val = localStorage.getItem(REFRESH_KEY)
     if (val) return val
-  } catch {}
+  } catch { }
   try {
     return sessionStorage.getItem(REFRESH_KEY)
   } catch {
@@ -81,7 +81,7 @@ export function setRefreshToken(token: string) {
   } catch {
     try {
       sessionStorage.setItem(REFRESH_KEY, token)
-    } catch {}
+    } catch { }
   }
 }
 
@@ -105,77 +105,37 @@ export function isTokenExpired(token?: string | null) {
 }
 
 export function bootstrapCentralAuthSession(): CentralSession | null {
-  if (typeof window === 'undefined') return null;
+  if (typeof window === "undefined") return null;
 
-  const url = new URL(window.location.href);
+  const params = new URLSearchParams(window.location.search);
 
-  const accessToken =
-    url.searchParams.get('accesstoken') ||
-    url.searchParams.get('accessToken');
+  const accessToken = params.get("accesstoken");
+  const refreshToken = params.get("refreshtoken");
+  const userid = params.get("userid") || params.get("userId");
+  const name = params.get("name") || undefined;
+  const email = params.get("email") || undefined;
 
-  const refreshToken =
-    url.searchParams.get('refreshtoken') ||
-    url.searchParams.get('refreshToken');
+  if (accessToken && userid) {
+    const session: CentralSession = {
+      accessToken,
+      user: {
+        userid,
+        name,
+        email,
+      },
+    };
 
-  const queryUserId =
-    url.searchParams.get('userid') ||
-    url.searchParams.get('userId');
+    setSession(session);
+    if (refreshToken) setRefreshToken(refreshToken);
 
-  const email = url.searchParams.get('email') || undefined;
-  const name =
-    url.searchParams.get('name') ||
-    url.searchParams.get('fullname') ||
-    undefined;
-  const avatarurl = url.searchParams.get('avatarurl') || undefined;
+    const cleanUrl = new URL(window.location.href);
+    ["accesstoken", "refreshtoken", "userid", "userId", "name", "email"].forEach((key) =>
+      cleanUrl.searchParams.delete(key)
+    );
+    window.history.replaceState({}, "", cleanUrl.pathname + cleanUrl.search);
 
-  if (!accessToken) return null;
+    return session;
+  }
 
-  const decoded = decodeJwt(accessToken) ?? {};
-
-  const tokenUserId =
-    (typeof decoded.sub === 'string' && decoded.sub) ||
-    (typeof decoded.userid === 'string' && decoded.userid) ||
-    (typeof decoded.userId === 'string' && decoded.userId) ||
-    null;
-
-  const userId = queryUserId || tokenUserId;
-  if (!userId) return null;
-
-  const finalEmail =
-    email || (typeof decoded.email === 'string' ? decoded.email : undefined);
-
-  const finalName =
-    name ||
-    (typeof decoded.name === 'string' ? decoded.name : undefined) ||
-    (typeof decoded.fullname === 'string' ? decoded.fullname : undefined);
-
-  const session: CentralSession = {
-    accessToken,
-    user: {
-      userid: userId,
-      email: finalEmail,
-      name: finalName,
-      fullname: finalName,
-      avatarurl,
-    },
-  };
-
-  setSession(session);
-  if (refreshToken) setRefreshToken(refreshToken);
-
-  [
-    'accesstoken',
-    'accessToken',
-    'refreshtoken',
-    'refreshToken',
-    'userid',
-    'userId',
-    'email',
-    'name',
-    'fullname',
-    'avatarurl',
-  ].forEach((key) => url.searchParams.delete(key));
-
-  window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
-  return session;
+  return getSession();
 }

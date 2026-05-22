@@ -1,20 +1,24 @@
-import { createBrowserClient } from '@supabase/ssr'
-import { getSession } from './auth'
-import { env } from './env'
+// lib/supabase.ts
+import { createClient } from "@supabase/supabase-js";
 
-export const supabase = createBrowserClient(
-  env.supabaseUrl,
-  env.supabaseAnonKey,
+export const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
   {
-    global: {
-      fetch: (url, options = {}) => {
-        const session = getSession()
-        const headers = new Headers((options as RequestInit).headers)
-        if (session?.accessToken) {
-          headers.set('Authorization', `Bearer ${session.accessToken}`)
-        }
-        return fetch(url, { ...options, headers })
-      }
-    }
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+    realtime: {
+      params: {
+        apikey: process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      },
+    },
   }
-)
+);
+
+export function applySupabaseAccessToken(_token?: string | null) {
+  // Intentionally disabled for now.
+  // TrexaFlow uses Central Auth for app auth and server routes for protected DB operations.
+}

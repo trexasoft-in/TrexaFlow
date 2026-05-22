@@ -1,16 +1,18 @@
-"use client"
+"use client";
 
-import { useEffect } from "react"
-import { useRouter } from "next/navigation"
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
+import { useAuthStore } from "@/store/useAuthStore";
 import {
   bootstrapCentralAuthSession,
-  clearSession,
-  getSession,
+  getRefreshToken,
   isTokenExpired,
-} from "@/lib/auth"
-import { safeRedirectToLogin } from "@/lib/authRedirect"
-import { useAuthStore } from "@/store/useAuthStore"
-import { refreshSessionShared } from "@/lib/refreshSession"
+  setSession,
+  clearSession,
+} from "@/lib/auth";
+import { env } from "@/lib/env";
+import { applySupabaseAccessToken } from "@/lib/supabase";
+import { safeRedirectToLogin } from "@/lib/authRedirect";
 
 export function useAuthBootstrap() {
   const setStoreSession = useAuthStore((s) => s.setSession);
@@ -20,43 +22,96 @@ export function useAuthBootstrap() {
   useEffect(() => {
     let mounted = true;
 
-    const applyRealtimeAuth = async (token: string) => {
-      const { supabase } = await import('./supabase');
-      supabase.realtime.setAuth(token);
-    };
-
     const init = async () => {
-      const fromUrl = bootstrapCentralAuthSession();
-      if (fromUrl?.accessToken && fromUrl?.user) {
-        if (!mounted) return;
-        setStoreSession(fromUrl);
-        await applyRealtimeAuth(fromUrl.accessToken);
+      const session = bootstrapCentralAuthSession();
+
+      if (!session?.accessToken || !session?.user?.userid) {
+        if (mounted) {
+          clearStoreSession();
+          applySupabaseAccessToken(null);
+          setHydrated(true);
+        }
         return;
       }
 
-      const stored = getSession();
-      if (stored?.accessToken && stored?.user && !isTokenExpired(stored.accessToken)) {
-        if (!mounted) return;
-        setStoreSession(stored);
-        await applyRealtimeAuth(stored.accessToken);
-        return;
+      if (isTokenExpired(session.accessToken)) {
+        const refreshToken = getRefreshToken();
+
+        if (!refreshToken) {
+          if (mounted) {
+            clearStoreSession();
+            applySupabaseAccessToken(null);
+            setHydrated(true);
+          }
+          return;
+        }
+
+        try {
+          const res = await fetch(`${env.centralAuthApiUrl}auth/refresh`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ refreshToken }),
+          });
+
+          if (!res.ok) {
+            if (mounted) {
+              clearSession();
+              clearStoreSession();
+              applySupabaseAccessToken(null);
+              setHydrated(true);
+            }
+            return;
+          }
+
+          const data = await res.json();
+          const nextAccessToken =
+            data?.accessToken ?? data?.accesstoken ?? null;
+
+          if (!nextAccessToken) {
+            if (mounted) {
+              clearSession();
+              clearStoreSession();
+              applySupabaseAccessToken(null);
+              setHydrated(true);
+            }
+            return;
+          }
+
+          const refreshedSession = {
+            accessToken: nextAccessToken,
+            user: session.user,
+          };
+
+          setSession(refreshedSession);
+
+          if (mounted) {
+            setStoreSession(refreshedSession);
+            applySupabaseAccessToken(null);
+            setHydrated(true);
+          }
+          return;
+        } catch {
+          if (mounted) {
+            clearSession();
+            clearStoreSession();
+            applySupabaseAccessToken(null);
+            setHydrated(true);
+          }
+          return;
+        }
       }
 
-      const refreshed = await refreshSessionShared();
-      if (refreshed?.accessToken && refreshed?.user) {
-        if (!mounted) return;
-        setStoreSession(refreshed);
-        await applyRealtimeAuth(refreshed.accessToken);
-        return;
+      if (mounted) {
+        setStoreSession(session);
+        applySupabaseAccessToken(null);
+        setHydrated(true);
       }
-
-      clearSession();
-      if (!mounted) return;
-      clearStoreSession();
-      setHydrated(true);
     };
 
     init();
+
     return () => {
       mounted = false;
     };
@@ -64,57 +119,66 @@ export function useAuthBootstrap() {
 }
 
 export function useRequireAuth() {
-  const router = useRouter()
-  const user = useAuthStore((s) => s.user)
-  const hydrated = useAuthStore((s) => s.hydrated)
+  const user = useAuthStore((s) => s.user);
+  const hydrated = useAuthStore((s) => s.hydrated);
 
-  useAuthBootstrap()
+  useAuthBootstrap();
 
   useEffect(() => {
-    if (!hydrated) return
-    if (!user?.userid) {
-      safeRedirectToLogin()
-    }
-  }, [hydrated, user?.userid, router])
+    if (!hydrated) return;
+    if (!user?.userid) safeRedirectToLogin();
+  }, [hydrated, user?.userid]);
+
+  const normalizedUser = user
+    ? { ...user, id: user.userid, userid: user.userid }
+    : null;
 
   return {
-    user,
+    user: normalizedUser,
     userId: user?.userid ?? null,
     checking: !hydrated,
-  }
+  };
 }
 
 export function useRedirectIfAuthed() {
-  const router = useRouter()
-  const user = useAuthStore((s) => s.user)
-  const hydrated = useAuthStore((s) => s.hydrated)
+  const router = useRouter();
+  const user = useAuthStore((s) => s.user);
+  const hydrated = useAuthStore((s) => s.hydrated);
 
-  useAuthBootstrap()
+  useAuthBootstrap();
 
   useEffect(() => {
-    if (!hydrated || !user?.userid) return
+    if (!hydrated || !user?.userid) return;
 
     const go = async () => {
-      const { supabase } = await import("@/lib/supabase")
+      try {
+        const token = useAuthStore.getState().accessToken;
+        if (!token) return;
 
-      const { data: membership } = await supabase
-        .from("workspace_members")
-        .select("workspace_id")
-        .eq("user_id", user.userid)
-        .limit(1)
-        .single()
+        const res = await fetch("/api/me/bootstrap", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        });
 
-      if (membership?.workspace_id) {
-        router.replace(`/workspace/${membership.workspace_id}`)
-      } else {
-        router.replace("/onboarding")
+        if (!res.ok) {
+          router.replace("/onboarding");
+          return;
+        }
+
+        const data = await res.json();
+        if (data.workspaceId) router.replace(`/workspace/${data.workspaceId}`);
+        else router.replace("/onboarding");
+      } catch (err) {
+        console.error("Failed to check workspace redirect", err);
+        router.replace("/onboarding");
       }
-    }
+    };
 
-    go()
-  }, [hydrated, user?.userid, router])
+    go();
+  }, [hydrated, user?.userid, router]);
 
   return {
     checking: !hydrated,
-  }
+  };
 }

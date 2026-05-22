@@ -3,8 +3,8 @@
 import { useEffect, useState, useRef } from "react"
 import { useRouter } from "next/navigation"
 import { User, Briefcase, Upload, X, ArrowRight, Loader2, Plus, LogIn } from "lucide-react"
-import { supabase } from "@/lib/supabase"
 import { useRequireAuth } from "@/lib/useAuth"
+import { useAuthStore } from "@/store/useAuthStore"
 
 type Step = "profile" | "workspace"
 
@@ -41,34 +41,38 @@ export default function OnboardingPage() {
     if (!userId) return
 
     const checkAndRedirect = async () => {
-      // If user already has a workspace, skip onboarding entirely
-      const { data: membership } = await supabase
-        .from("workspace_members")
-        .select("workspace_id")
-        .eq("user_id", userId)
-        .limit(1)
-        .single()
+      try {
+        const token = useAuthStore.getState().accessToken
+        if (!token) return
 
-      if (membership) {
-        router.replace(`/workspace/${membership.workspace_id}`)
-        return
+        const res = await fetch("/api/me/bootstrap", {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        })
+
+        if (res.status === 401) {
+          return
+        }
+
+        if (res.ok) {
+          const data = await res.json()
+          if (data.workspaceId) {
+            router.replace(`/workspace/${data.workspaceId}`)
+            return
+          }
+
+          if (data.profile?.full_name) {
+            setFullName(data.profile.full_name)
+            setJobTitle(data.profile.job_title || "")
+            setStep("workspace")
+          }
+        }
+      } catch (err) {
+        console.error("Failed to bootstrap onboarding state", err)
+      } finally {
+        setChecking(false)
       }
-
-      // Pre-fill name if profile already exists
-      const { data: profile } = await supabase
-        .from("users")
-        .select("*")
-        .eq("id", userId)
-        .single()
-
-      if (profile?.full_name) {
-        setFullName(profile.full_name)
-        setJobTitle(profile.job_title || "")
-        // Profile done, skip to workspace step
-        setStep("workspace")
-      }
-
-      setChecking(false)
     }
 
     checkAndRedirect()
@@ -105,10 +109,7 @@ export default function OnboardingPage() {
 
   // ── Upload file to Supabase Storage ──
   const uploadFile = async (file: File, bucket: string, path: string): Promise<string | null> => {
-    const { error } = await supabase.storage.from(bucket).upload(path, file, { upsert: true })
-    if (error) return null
-    const { data } = supabase.storage.from(bucket).getPublicUrl(path)
-    return data.publicUrl
+    return null
   }
 
   // ── Generate short workspace ID ──
@@ -139,18 +140,32 @@ export default function OnboardingPage() {
       avatarUrl = await uploadFile(avatarFile, "avatars", `${userId}/avatar`) || ""
     }
 
-    // Save user profile in local Supabase DB
-    const { error: profileError } = await supabase.from("users").upsert({
-      id: userId,
-      email: user?.email ?? null,
-      full_name: fullName.trim(),
-      job_title: jobTitle.trim(),
-      avatar_url: avatarUrl || null,
-    })
+    // Save user profile securely via server API route
+    const token = useAuthStore.getState().accessToken;
+    const apiFetch = async (url: string, options: RequestInit = {}) => {
+      return fetch(url, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+          ...(options.headers || {}),
+        },
+      });
+    };
 
-    if (profileError) {
-      setLoading(false)
-      return setError("Failed to save profile. Please try again.")
+    const profileRes = await apiFetch("/api/profile/save", {
+      method: "POST",
+      body: JSON.stringify({
+        fullName: fullName.trim(),
+        jobTitle: jobTitle.trim(),
+        avatarUrl: avatarUrl || null,
+      }),
+    });
+
+    if (!profileRes.ok) {
+      const errData = await profileRes.json().catch(() => ({}));
+      setLoading(false);
+      return setError(errData.error || "Failed to save profile. Please try again.");
     }
 
     if (wsMode === "join") {
@@ -159,67 +174,21 @@ export default function OnboardingPage() {
         return setError("Please enter a workspace ID.")
       }
 
-      const { data: workspace } = await supabase
-        .from("workspaces")
-        .select("id")
-        .eq("workspace_code", joinId.trim().toUpperCase())
-        .single()
+      const joinRes = await apiFetch("/api/workspaces/join", {
+        method: "POST",
+        body: JSON.stringify({
+          code: joinId.trim().toUpperCase(),
+          fullName: fullName.trim(),
+        }),
+      });
 
-      if (!workspace) {
-        setLoading(false)
-        return setError("Workspace not found. Please check the ID.")
+      if (!joinRes.ok) {
+        const errData = await joinRes.json().catch(() => ({}));
+        setLoading(false);
+        return setError(errData.error || "Workspace not found or failed to join. Please check the ID.");
       }
 
-      // Check if already a member
-      const { data: existing } = await supabase
-        .from("workspace_members")
-        .select("id")
-        .eq("workspace_id", workspace.id)
-        .eq("user_id", userId)
-        .single()
-
-      if (!existing) {
-        await supabase.from("workspace_members").insert({
-          workspace_id: workspace.id,
-          user_id: userId,
-          role: "member",
-        })
-
-        // Auto-add new member to all public channels in the workspace
-        const { data: publicChannels } = await supabase
-          .from("channels")
-          .select("id")
-          .eq("workspace_id", workspace.id)
-          .eq("is_private", false)
-
-        if (publicChannels && publicChannels.length > 0) {
-          await supabase.from("channel_members").insert(
-            publicChannels.map(ch => ({
-              channel_id: ch.id,
-              user_id: userId,
-            }))
-          )
-        }
-
-        // Find the Lobby channel
-        const { data: lobbyChannel } = await supabase
-          .from("channels")
-          .select("id")
-          .eq("workspace_id", workspace.id)
-          .eq("is_default", true)
-          .single()
-
-        // Post welcome message in Lobby
-        if (lobbyChannel) {
-          await supabase.from("messages").insert({
-            channel_id: lobbyChannel.id,
-            sender_id: userId,
-            content: `👋 **${fullName.trim()}** just joined the workspace. Welcome!`,
-            is_pinned: false,
-            is_system: true,
-          })
-        }
-      }
+      const { workspace } = await joinRes.json();
 
       setLoading(false)
       router.push(`/workspace/${workspace.id}`)
@@ -235,61 +204,26 @@ export default function OnboardingPage() {
         wsImageUrl = await uploadFile(wsImageFile, "workspace-images", `${userId}/ws-image-${Date.now()}`) || ""
       }
 
-      const workspaceCode = generateWorkspaceId()
-
-      const { data: newWorkspace, error: wsError } = await supabase
-        .from("workspaces")
-        .insert({
+      const createRes = await apiFetch("/api/workspaces/create", {
+        method: "POST",
+        body: JSON.stringify({
           name: wsName.trim(),
           description: wsDescription.trim() || null,
-          image_url: wsImageUrl || null,
-          workspace_code: workspaceCode,
-          owner_id: userId,
-        })
-        .select()
-        .single()
+          imageUrl: wsImageUrl || null,
+          fullName: fullName.trim(),
+        }),
+      });
 
-      if (wsError || !newWorkspace) {
-        setLoading(false)
-        return setError("Failed to create workspace. Please try again.")
+      if (!createRes.ok) {
+        const errData = await createRes.json().catch(() => ({}));
+        setLoading(false);
+        return setError(errData.error || "Failed to create workspace. Please try again.");
       }
 
-      // Add owner as admin member
-      await supabase.from("workspace_members").insert({
-        workspace_id: newWorkspace.id,
-        user_id: userId,
-        role: "admin",
-      })
-
-      // Create default Lobby channel
-      const { data: lobbyChannel } = await supabase.from("channels").insert({
-        workspace_id: newWorkspace.id,
-        name: "lobby",
-        description: "Welcome to the workspace!",
-        is_private: false,
-        created_by: userId,
-        is_default: true,
-      }).select().single()
-
-      // Post welcome message in Lobby
-      if (lobbyChannel) {
-        // Add creator to lobby channel_members
-        await supabase.from("channel_members").insert({
-          channel_id: lobbyChannel.id,
-          user_id: userId,
-        })
-
-        await supabase.from("messages").insert({
-          channel_id: lobbyChannel.id,
-          sender_id: userId,
-          content: `👋 **${fullName.trim()}** created this workspace. Welcome!`,
-          is_pinned: false,
-          is_system: true,
-        })
-      }
+      const { workspace } = await createRes.json();
 
       setLoading(false)
-      router.push(`/workspace/${newWorkspace.id}`)
+      router.push(`/workspace/${workspace.id}`)
     }
   }
 

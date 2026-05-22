@@ -10,7 +10,7 @@ function AuthPageInner() {
 
   useEffect(() => {
     const origin = window.location.origin
-    const returnTo = params.get("returnTo") ?? `${origin}/main/onboarding`
+    const returnTo = params.get("returnTo") ?? `${origin}/auth/callback`
 
     const mode = params.get("mode")
 

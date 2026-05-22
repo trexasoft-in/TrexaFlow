@@ -11,9 +11,10 @@ import {
   LayoutDashboard, Milestone, CheckSquare2, ClipboardList, Flag, UserPlus, RefreshCcw, CheckCircle2, ExternalLink, Shield,
   Search, Briefcase, ArrowRight,
 } from "lucide-react";
-import { supabase } from "@/lib/supabase";
+import { supabase, applySupabaseAccessToken } from "@/lib/supabase";
 import { stripHtmlForPreview } from "@/utils/stripHtml";
 import { useRequireAuth } from "@/lib/useAuth";
+import { useAuthStore } from "@/store/useAuthStore";
 import { WorkspaceInfoModal } from '@/components/workspace/WorkspaceInfoModal';
 import { markChannelRead, markDMRead, markProjectChatRead, getChannelUnreadCount, getDMUnreadCount } from "@/utils/reads";
 import { trackProjectAccess, getRecentProjects, getProjectUnreadCount } from "@/utils/projectAccess";
@@ -354,6 +355,14 @@ function TaskTypeIcon({
       style={{ color: '#3b82f6', flexShrink: 0 }}
     />
   );
+}
+
+// ─── Safe localStorage helpers ────────────────────────────
+function safeGetStorage(key: string): string | null {
+  try { return localStorage.getItem(key); } catch { return null; }
+}
+function safeSetStorage(key: string, value: string): void {
+  try { localStorage.setItem(key, value); } catch { /* silently ignore */ }
 }
 
 // ─── Component ───────────────────────────────────────────
@@ -1090,11 +1099,19 @@ function WorkspacePage() {
 
     setLoadingProjects(true);
 
-    const { data: allProjects } = await supabase
+    const { data: allProjects, error: projErr } = await supabase
       .from("projects")
       .select("*")
       .eq("workspace_id", workspaceId)
       .order("created_at");
+
+    if (projErr) {
+      console.error('loadProjects error', projErr);
+      setProjects([]);
+      setRecentProjectIds([]);
+      setLoadingProjects(false);
+      return;
+    }
 
     if (!allProjects?.length) {
       setProjects([]);
@@ -1109,11 +1126,19 @@ function WorkspacePage() {
     let allowedPrivateIds = new Set<string>();
 
     if (privateProjects.length > 0) {
-      const { data: memberships } = await supabase
+      const { data: memberships, error: pmErr } = await supabase
         .from("project_members")
         .select("project_id")
         .eq("user_id", uid)
         .in("project_id", privateProjects.map((p) => p.id));
+
+      if (pmErr) {
+        console.error('loadProject memberships error', pmErr);
+        setProjects([]);
+        setRecentProjectIds([]);
+        setLoadingProjects(false);
+        return;
+      }
 
       allowedPrivateIds = new Set((memberships ?? []).map((m: any) => m.project_id));
     }
@@ -1155,7 +1180,7 @@ function WorkspacePage() {
             if (!membership) return;
           }
           setProjects(prev => prev.find(p => p.id === proj.id) ? prev : [...prev, proj]);
-          loadProjectUnreadCounts();
+          loadProjectUnreadCounts(userId);
         }
       )
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'project_messages' },
@@ -1209,7 +1234,12 @@ function WorkspacePage() {
   };
 
   // Recently accessed project IDs (max 10), fetched from DB
-  const [recentProjectIds, setRecentProjectIds] = useState<string[]>([]);
+  const [recentProjectIds, setRecentProjectIds] = useState<string[]>(() => {
+    if (typeof window === 'undefined') return [];
+    try {
+      return JSON.parse(safeGetStorage('trexaflow-recent-projects') || '[]');
+    } catch { return []; }
+  });
 
   // All Projects view state
   const [allProjectsSearch, setAllProjectsSearch] = useState('');
@@ -1248,6 +1278,7 @@ function WorkspacePage() {
 
     setRecentProjectIds((prev) => {
       const next = [project.id, ...prev.filter((id) => id !== project.id)].slice(0, 10);
+      safeSetStorage('trexaflow-recent-projects', JSON.stringify(next));
       return next;
     });
 
@@ -1400,7 +1431,11 @@ function WorkspacePage() {
       return;
     }
 
-    if (targetUserId === activeProject.created_by) {
+    const projectOwnerId =
+      activeProject.created_by ||
+      (activeProject as any).createdby;
+
+    if (targetUserId === projectOwnerId) {
       showToast("Project creator cannot be removed from the project.", "error");
       return;
     }
@@ -1586,9 +1621,9 @@ function WorkspacePage() {
       parent_message_id: projectReplyingTo?.id ?? null,
       parent_snapshot: projectReplyingTo
         ? {
-            sendername: projectReplyingTo.sender?.full_name ?? "Unknown",
-            content: projectReplyingTo.content,
-          }
+          sendername: projectReplyingTo.sender?.full_name ?? "Unknown",
+          content: projectReplyingTo.content,
+        }
         : null,
       is_pinned: false,
     } as ProjectMessage;
@@ -1615,9 +1650,9 @@ function WorkspacePage() {
         parent_message_id: projectReplyingTo?.id ?? null,
         parent_snapshot: projectReplyingTo
           ? {
-              sendername: projectReplyingTo.sender?.full_name ?? "Unknown",
-              content: projectReplyingTo.content,
-            }
+            sendername: projectReplyingTo.sender?.full_name ?? "Unknown",
+            content: projectReplyingTo.content,
+          }
           : null,
       })
       .select("*, sender:users(*)")
@@ -1764,25 +1799,67 @@ function WorkspacePage() {
   };
 
   // Load unread counts for all projects the user is a member of
-  const loadProjectUnreadCounts = async () => {
-    if (!me) return;
+  const loadProjectUnreadCounts = async (currentUserId?: string) => {
+    const uid = currentUserId ?? me?.id;
+    if (!uid) return;
 
-    // Get all projects user is in
-    const { data: memberships } = await supabase
-      .from('project_members')
-      .select('project_id')
-      .eq('user_id', me.id);
-    if (!memberships?.length) return;
+    try {
+      const { data: allProjects, error: projectsError } = await supabase
+        .from("projects")
+        .select("id, is_private")
+        .eq("workspace_id", workspaceId);
 
-    const projectIds = memberships.map((m: any) => m.project_id);
+      if (projectsError) {
+        console.error("loadProjectUnreadCounts projects error:", projectsError);
+        setProjectChatUnread({});
+        return;
+      }
 
-    const counts: Record<string, number> = {};
-    await Promise.all(
-      projectIds.map(async (pid: string) => {
-        counts[pid] = await getProjectUnreadCount(pid, me.id);
-      })
-    );
-    setProjectChatUnread(counts);
+      const publicProjectIds = (allProjects ?? [])
+        .filter((p: any) => !p.is_private)
+        .map((p: any) => p.id);
+
+      const privateProjects = (allProjects ?? []).filter((p: any) => p.is_private);
+      let allowedPrivateIds: string[] = [];
+
+      if (privateProjects.length > 0) {
+        const { data: memberships, error: membershipError } = await supabase
+          .from("project_members")
+          .select("project_id")
+          .eq("user_id", uid)
+          .in("project_id", privateProjects.map((p: any) => p.id));
+
+        if (membershipError) {
+          console.error("loadProjectUnreadCounts membership error:", membershipError);
+        } else {
+          allowedPrivateIds = (memberships ?? []).map((m: any) => m.project_id);
+        }
+      }
+
+      const visibleProjectIds = [...publicProjectIds, ...allowedPrivateIds];
+
+      if (visibleProjectIds.length === 0) {
+        setProjectChatUnread({});
+        return;
+      }
+
+      const unreadEntries = await Promise.all(
+        visibleProjectIds.map(async (projectId) => {
+          try {
+            const count = await getProjectUnreadCount(projectId, uid);
+            return [projectId, count] as const;
+          } catch (err) {
+            console.error("getProjectUnreadCount error for", projectId, err);
+            return [projectId, 0] as const;
+          }
+        })
+      );
+
+      setProjectChatUnread(Object.fromEntries(unreadEntries));
+    } catch (err) {
+      console.error("loadProjectUnreadCounts failed:", err);
+      setProjectChatUnread({});
+    }
   };
 
 
@@ -1997,14 +2074,14 @@ function WorkspacePage() {
     const allowed =
       task.type === "task"
         ? (
-            (newStatus === "complete" && (isAssignee || isCreator || canAdminTask)) ||
-            (["open", "active"].includes(newStatus) && (isCreator || canAdminTask))
-          )
+          (newStatus === "complete" && (isAssignee || isCreator || canAdminTask)) ||
+          (["open", "active"].includes(newStatus) && (isCreator || canAdminTask))
+        )
         : (
-            task.type === "milestone" &&
-            newStatus === "complete" &&
-            canAdminTask
-          );
+          task.type === "milestone" &&
+          newStatus === "complete" &&
+          canAdminTask
+        );
 
     if (!allowed) {
       showToast("You do not have permission to change this task status.", "error");
@@ -2203,44 +2280,74 @@ function WorkspacePage() {
     try {
       meIdRef.current = currentUserId;
 
-    const { data: profile } = await supabase
-      .from("users").select("*").eq("id", currentUserId).single();
-
-    if (!profile?.full_name || !profile?.job_title) {
-      router.replace("/main/onboarding");
-      return;
-    }
-    setMe(profile);
-    await loadMyWorkspaces(currentUserId);
-
-    // Verify membership
-    const { data: membership } = await supabase
-      .from("workspace_members")
-      .select("workspace_id")
-      .eq("workspace_id", workspaceId)
-      .eq("user_id", currentUserId)
-      .single();
-
-    if (!membership) {
-      const { data: anyMemberships } = await supabase
-        .from("workspace_members")
-        .select("workspace_id")
-        .eq("user_id", currentUserId)
-        .limit(1);
-      if (anyMemberships && anyMemberships.length > 0) {
-        return router.replace(`/workspace/${anyMemberships[0].workspace_id}`);
+      const token = useAuthStore.getState().accessToken;
+      if (!token) {
+        router.replace('/auth');
+        return;
       }
-      return router.replace("/main/onboarding");
-    }
 
-    const { data: ws } = await supabase
-      .from("workspaces").select("*").eq("id", workspaceId).single();
-    setWorkspace(ws);
+      applySupabaseAccessToken(token);
 
-    // Fetch public channels
-    const { data: publicChans } = await supabase
-      .from("channels")
-      .select(`
+      const bootRes = await fetch('/api/me/bootstrap', {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (bootRes.status === 401) {
+        router.replace('/auth');
+        return;
+      }
+
+      if (!bootRes.ok) {
+        router.replace('/onboarding');
+        return;
+      }
+
+      const boot = await bootRes.json();
+      const profile = boot.profile;
+
+      if (!profile?.full_name || !profile?.job_title) {
+        router.replace('/onboarding');
+        return;
+      }
+
+      setMe(profile);
+
+      if (boot.workspaces && Array.isArray(boot.workspaces)) {
+        setMyWorkspaces(boot.workspaces);
+      } else {
+        await loadMyWorkspaces(currentUserId);
+      }
+
+      const allowedWorkspaceIds: string[] = boot.workspaceIds || [];
+      if (!allowedWorkspaceIds.includes(workspaceId)) {
+        if (boot.workspaceId) {
+          router.replace(`/workspace/${boot.workspaceId}`);
+          return;
+        }
+        router.replace('/onboarding');
+        return;
+      }
+
+      const { data: ws, error: wsError } = await supabase
+        .from('workspaces')
+        .select('*')
+        .eq('id', workspaceId)
+        .single();
+
+      if (wsError || !ws) {
+        console.error('Failed to load workspace', wsError);
+        showToast('Failed to load workspace.', 'error');
+        return;
+      }
+
+      setWorkspace(ws);
+
+      // Fetch public channels
+      const { data: publicChans } = await supabase
+        .from("channels")
+        .select(`
         *,
         messages (
           content,
@@ -2250,25 +2357,25 @@ function WorkspacePage() {
           sender:users ( full_name )
         )
       `)
-      .eq("workspace_id", workspaceId)
-      .eq("is_private", false)
-      .order("created_at", { referencedTable: "messages", ascending: false })
-      .limit(1, { referencedTable: "messages" })
-      .order("is_default", { ascending: false })
-      .order("created_at");
+        .eq("workspace_id", workspaceId)
+        .eq("is_private", false)
+        .order("created_at", { referencedTable: "messages", ascending: false })
+        .limit(1, { referencedTable: "messages" })
+        .order("is_default", { ascending: false })
+        .order("created_at");
 
-    // Fetch private channels user is a member of
-    const { data: privateMemberships } = await supabase
-      .from("channel_members")
-      .select("channel_id")
-      .eq("user_id", currentUserId);
+      // Fetch private channels user is a member of
+      const { data: privateMemberships } = await supabase
+        .from("channel_members")
+        .select("channel_id")
+        .eq("user_id", currentUserId);
 
-    const privateChannelIds = privateMemberships?.map(m => m.channel_id) || [];
-    let privateChans: any[] = [];
-    if (privateChannelIds.length > 0) {
-      const { data } = await supabase
-        .from("channels")
-        .select(`
+      const privateChannelIds = privateMemberships?.map(m => m.channel_id) || [];
+      let privateChans: any[] = [];
+      if (privateChannelIds.length > 0) {
+        const { data } = await supabase
+          .from("channels")
+          .select(`
           *,
           messages (
             content,
@@ -2278,379 +2385,385 @@ function WorkspacePage() {
             sender:users ( full_name )
           )
         `)
-        .eq("workspace_id", workspaceId)
-        .eq("is_private", true)
-        .in("id", privateChannelIds)
-        .order("created_at", { referencedTable: "messages", ascending: false })
-        .limit(1, { referencedTable: "messages" })
-        .order("created_at");
-      privateChans = data || [];
-    }
-
-    const chans = [
-      ...(publicChans || []).sort((a, b) => (b.is_default ? 1 : 0) - (a.is_default ? 1 : 0)),
-      ...privateChans,
-    ];
-    setChannels(chans);
-
-    // Populate channel last messages
-    const lastMsgs: Record<string, { senderName: string; text: string }> = {};
-    chans.forEach((ch: any) => {
-      const lastMsg = ch.messages?.[0];
-      if (lastMsg) {
-        const sender = lastMsg.sender;
-        const senderName = sender?.full_name?.split(' ')[0] ?? 'Someone';
-        const text = stripHtmlForPreview(lastMsg.content ?? '').slice(0, 50);
-        lastMsgs[ch.id] = { senderName, text };
+          .eq("workspace_id", workspaceId)
+          .eq("is_private", true)
+          .in("id", privateChannelIds)
+          .order("created_at", { referencedTable: "messages", ascending: false })
+          .limit(1, { referencedTable: "messages" })
+          .order("created_at");
+        privateChans = data || [];
       }
-    });
-    setChannelLastMsg(prev => ({ ...prev, ...lastMsgs }));
-    await fetchUnreadCounts(chans);
-    await loadMembers();
 
-    // Load projects FIRST to ensure state is ready if needed
-    await loadProjects(currentUserId);
-    subscribeToWorkspaceProjects(currentUserId);
-    await loadProjectUnreadCounts();
+      const chans = [
+        ...(publicChans || []).sort((a, b) => (b.is_default ? 1 : 0) - (a.is_default ? 1 : 0)),
+        ...privateChans,
+      ];
+      setChannels(chans);
 
-    const urlChannel = searchParams.get('channel');
-    const urlDm = searchParams.get('dm');
-    const urlProject = searchParams.get('project');
-
-    let handled = false;
-
-    if (!urlChannel && !urlDm && !urlProject) {
-      const saved = localStorage.getItem(`trexaflow_last_${workspaceId}`);
-      if (saved) {
-        router.replace(saved, { scroll: false });
-        // Parse what was explicitly saved
-        const savedUrl = new URL(saved, window.location.origin);
-        const savedCh = savedUrl.searchParams.get('channel');
-        const savedDm = savedUrl.searchParams.get('dm');
-        const savedProj = savedUrl.searchParams.get('project');
-
-        if (savedCh) {
-          const ch = chans.find(c => c.id === savedCh);
-          if (ch) { await switchChannel(ch); handled = true; }
-        } else if (savedDm) {
-          await openDm(savedDm);
-          handled = true;
-        } else if (savedProj) {
-          const { data: proj } = await supabase.from('projects').select('*').eq('id', savedProj).single();
-          if (proj) { await openProject(proj); handled = true; }
-        }
-      }
-    }
-
-    if (!handled) {
-      // Fallback or explicit URL passed
-      if (urlDm) {
-        await openDm(urlDm);
-      } else if (urlProject) {
-        const { data: proj } = await supabase.from('projects').select('*').eq('id', urlProject).single();
-        if (proj) await openProject(proj);
-      } else {
-        const startChannel =
-          chans.find(c => c.id === urlChannel) ??
-          chans.find(c => c.is_default) ??
-          chans[0];
-
-        if (startChannel) await switchChannel(startChannel);
-      }
-    }
-
-    setLoading(false);
-
-    // ── Presence channel (shared with DM page — same channel name) ──
-    if (presenceChannelRef.current) {
-      presenceChannelRef.current.untrack();
-      supabase.removeChannel(presenceChannelRef.current);
-      presenceChannelRef.current = null;
-    }
-
-    const presenceCh = supabase.channel(`presence-workspace-${workspaceId}`, {
-      config: { presence: { key: currentUserId } },
-    });
-
-    presenceCh
-      .on("presence", { event: "sync" }, () => {
-        const state = presenceCh.presenceState();
-        const online = new Set(Object.keys(state));
-        setOnlineUsers(online);
-        if (activeDmUserId) setIsOtherOnline(online.has(activeDmUserId));
-      })
-      .on("presence", { event: "join" }, ({ key }) => {
-        setOnlineUsers(prev => {
-          const next = new Set(prev);
-          next.add(key);
-          return next;
-        });
-        if (key === activeDmUserId) setIsOtherOnline(true);
-      })
-      .on("presence", { event: "leave" }, ({ key }) => {
-        setOnlineUsers(prev => {
-          const next = new Set(prev);
-          next.delete(key);
-          return next;
-        });
-        if (key === activeDmUserId) setIsOtherOnline(false);
-      })
-      .subscribe(async status => {
-        if (status === "SUBSCRIBED") {
-          await presenceCh.track({
-            user_id: currentUserId,
-            full_name: profile?.full_name,
-            online_at: new Date().toISOString(),
-          });
+      // Populate channel last messages
+      const lastMsgs: Record<string, { senderName: string; text: string }> = {};
+      chans.forEach((ch: any) => {
+        const lastMsg = ch.messages?.[0];
+        if (lastMsg) {
+          const sender = lastMsg.sender;
+          const senderName = sender?.full_name?.split(' ')[0] ?? 'Someone';
+          const text = stripHtmlForPreview(lastMsg.content ?? '').slice(0, 50);
+          lastMsgs[ch.id] = { senderName, text };
         }
       });
+      setChannelLastMsg(prev => ({ ...prev, ...lastMsgs }));
+      await fetchUnreadCounts(chans);
+      await Promise.all([
+        loadMembers(currentUserId),
+        loadProjects(currentUserId),
+        loadProjectUnreadCounts(currentUserId),
+      ]);
+      subscribeToWorkspaceProjects(currentUserId);
 
-    presenceChannelRef.current = presenceCh;
+      const urlChannel = searchParams.get('channel');
+      const urlDm = searchParams.get('dm');
 
-    // ── Realtime: channels table (create / rename / delete) ──
-    const chanRealtime = supabase
-      .channel(`channels-realtime-${workspaceId}`)
-      .on("postgres_changes", {
-        event: "INSERT",
-        schema: "public",
-        table: "channels",
-        filter: `workspace_id=eq.${workspaceId}`,
-      }, async (payload) => {
-        const newChan = payload.new as any;
-        // Only add to sidebar if this user is a member (public) or was just added
-        if (!newChan.is_private) {
-          setChannels(prev => {
-            if (prev.find(c => c.id === newChan.id)) return prev;
-            return [...prev, newChan];
-          });
-          // Auto-join public channels
-          await supabase.from("channel_members").upsert({
-            channel_id: newChan.id,
-            user_id: currentUserId,
-          }, { onConflict: "channel_id,user_id" });
+      if (urlDm && urlDm === currentUserId) {
+        router.replace(`/workspace/${workspaceId}`, { scroll: false });
+        return;
+      }
+
+      const urlProject = searchParams.get('project');
+
+      let handled = false;
+
+      if (!urlChannel && !urlDm && !urlProject) {
+        const saved = localStorage.getItem(`trexaflow_last_${workspaceId}`);
+        if (saved) {
+          router.replace(saved, { scroll: false });
+          // Parse what was explicitly saved
+          const savedUrl = new URL(saved, window.location.origin);
+          const savedCh = savedUrl.searchParams.get('channel');
+          const savedDm = savedUrl.searchParams.get('dm');
+          const savedProj = savedUrl.searchParams.get('project');
+
+          if (savedCh) {
+            const ch = chans.find(c => c.id === savedCh);
+            if (ch) { await switchChannel(ch); handled = true; }
+          } else if (savedDm) {
+            await openDm(savedDm);
+            handled = true;
+          } else if (savedProj) {
+            const { data: proj } = await supabase.from('projects').select('*').eq('id', savedProj).single();
+            if (proj) { await openProject(proj); handled = true; }
+          }
+        }
+      }
+
+      if (!handled) {
+        // Fallback or explicit URL passed
+        if (urlDm) {
+          await openDm(urlDm);
+        } else if (urlProject) {
+          const { data: proj } = await supabase.from('projects').select('*').eq('id', urlProject).single();
+          if (proj) await openProject(proj);
         } else {
-          // For private channels, only show if user is already a member
-          const { data: membership } = await supabase
-            .from("channel_members")
-            .select("channel_id")
-            .eq("channel_id", newChan.id)
-            .eq("user_id", currentUserId)
-            .single();
-          if (membership) {
+          const startChannel =
+            chans.find(c => c.id === urlChannel) ??
+            chans.find(c => c.is_default) ??
+            chans[0];
+
+          if (startChannel) await switchChannel(startChannel);
+        }
+      }
+
+      setLoading(false);
+
+      // ── Presence channel (shared with DM page — same channel name) ──
+      if (presenceChannelRef.current) {
+        presenceChannelRef.current.untrack();
+        supabase.removeChannel(presenceChannelRef.current);
+        presenceChannelRef.current = null;
+      }
+
+      const presenceCh = supabase.channel(`presence-workspace-${workspaceId}`, {
+        config: { presence: { key: currentUserId } },
+      });
+
+      presenceCh
+        .on("presence", { event: "sync" }, () => {
+          const state = presenceCh.presenceState();
+          const online = new Set(Object.keys(state));
+          setOnlineUsers(online);
+          if (activeDmUserId) setIsOtherOnline(online.has(activeDmUserId));
+        })
+        .on("presence", { event: "join" }, ({ key }) => {
+          setOnlineUsers(prev => {
+            const next = new Set(prev);
+            next.add(key);
+            return next;
+          });
+          if (key === activeDmUserId) setIsOtherOnline(true);
+        })
+        .on("presence", { event: "leave" }, ({ key }) => {
+          setOnlineUsers(prev => {
+            const next = new Set(prev);
+            next.delete(key);
+            return next;
+          });
+          if (key === activeDmUserId) setIsOtherOnline(false);
+        })
+        .subscribe(async status => {
+          if (status === "SUBSCRIBED") {
+            await presenceCh.track({
+              user_id: currentUserId,
+              full_name: profile?.full_name,
+              online_at: new Date().toISOString(),
+            });
+          }
+        });
+
+      presenceChannelRef.current = presenceCh;
+
+      // ── Realtime: channels table (create / rename / delete) ──
+      const chanRealtime = supabase
+        .channel(`channels-realtime-${workspaceId}`)
+        .on("postgres_changes", {
+          event: "INSERT",
+          schema: "public",
+          table: "channels",
+          filter: `workspace_id=eq.${workspaceId}`,
+        }, async (payload) => {
+          const newChan = payload.new as any;
+          // Only add to sidebar if this user is a member (public) or was just added
+          if (!newChan.is_private) {
             setChannels(prev => {
               if (prev.find(c => c.id === newChan.id)) return prev;
               return [...prev, newChan];
             });
+            // Auto-join public channels
+            await supabase.from("channel_members").upsert({
+              channel_id: newChan.id,
+              user_id: currentUserId,
+            }, { onConflict: "channel_id,user_id" });
           } else {
-            // This user was not auto-joined — mark list as stale so they see the hint
-            setChannelListStale(true);
+            // For private channels, only show if user is already a member
+            const { data: membership } = await supabase
+              .from("channel_members")
+              .select("channel_id")
+              .eq("channel_id", newChan.id)
+              .eq("user_id", currentUserId)
+              .single();
+            if (membership) {
+              setChannels(prev => {
+                if (prev.find(c => c.id === newChan.id)) return prev;
+                return [...prev, newChan];
+              });
+            } else {
+              // This user was not auto-joined — mark list as stale so they see the hint
+              setChannelListStale(true);
+            }
           }
-        }
-      })
-      .on("postgres_changes", {
-        event: "UPDATE",
-        schema: "public",
-        table: "channels",
-        filter: `workspace_id=eq.${workspaceId}`,
-      }, (payload) => {
-        const updated = payload.new as any;
-        setChannels(prev =>
-          prev.map(c => c.id === updated.id ? { ...c, ...updated } : c)
-        );
-        // If the active channel was renamed, update its name in the header too
-        setActiveChannel(prev =>
-          prev?.id === updated.id ? { ...prev, ...updated } : prev
-        );
-      })
-      .on("postgres_changes", {
-        event: "DELETE",
-        schema: "public",
-        table: "channels",
-      }, (payload) => {
-        const deletedId = payload.old?.id;
-        if (!deletedId) return;
-        setChannels(prev => prev.filter(c => c.id !== deletedId));
-        // If user is currently viewing the deleted channel, bounce to lobby
-        setActiveChannel(prev => {
-          if (prev?.id === deletedId) {
-            return null;
-          }
-          return prev;
-        });
-        setChannels(prev => {
-          const updated = prev.filter(c => c.id !== deletedId);
-          // Find lobby from the fresh list
-          const lobby = updated.find(c => c.is_default) ?? updated[0];
-          if (lobby && activeChannel?.id === deletedId) switchChannel(lobby);
-          return updated;
-        });
-      })
-      .subscribe();
+        })
+        .on("postgres_changes", {
+          event: "UPDATE",
+          schema: "public",
+          table: "channels",
+          filter: `workspace_id=eq.${workspaceId}`,
+        }, (payload) => {
+          const updated = payload.new as any;
+          setChannels(prev =>
+            prev.map(c => c.id === updated.id ? { ...c, ...updated } : c)
+          );
+          // If the active channel was renamed, update its name in the header too
+          setActiveChannel(prev =>
+            prev?.id === updated.id ? { ...prev, ...updated } : prev
+          );
+        })
+        .on("postgres_changes", {
+          event: "DELETE",
+          schema: "public",
+          table: "channels",
+        }, (payload) => {
+          const deletedId = payload.old?.id;
+          if (!deletedId) return;
+          setChannels(prev => prev.filter(c => c.id !== deletedId));
+          // If user is currently viewing the deleted channel, bounce to lobby
+          setActiveChannel(prev => {
+            if (prev?.id === deletedId) {
+              return null;
+            }
+            return prev;
+          });
+          setChannels(prev => {
+            const updated = prev.filter(c => c.id !== deletedId);
+            // Find lobby from the fresh list
+            const lobby = updated.find(c => c.is_default) ?? updated[0];
+            if (lobby && activeChannel?.id === deletedId) switchChannel(lobby);
+            return updated;
+          });
+        })
+        .subscribe();
 
-    // ── Realtime: channel messages ──
-    const msgSub = supabase
-      .channel(`messages-${workspaceId}`)
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "messages" },
-        async payload => {
-          const ch = activeChannelRef.current;
-          if (!ch) return;
+      // ── Realtime: channel messages ──
+      const msgSub = supabase
+        .channel(`messages-${workspaceId}`)
+        .on(
+          "postgres_changes",
+          { event: "*", schema: "public", table: "messages" },
+          async payload => {
+            const ch = activeChannelRef.current;
+            if (!ch) return;
 
-          if (payload.eventType === "INSERT") {
-            const msg = payload.new as Message;
-            // Never badge or append your own messages
-            if (msg.sender_id === meIdRef.current && meIdRef.current !== null) return;
+            if (payload.eventType === "INSERT") {
+              const msg = payload.new as Message;
+              // Never badge or append your own messages
+              if (msg.sender_id === meIdRef.current && meIdRef.current !== null) return;
 
-            if (msg.channel_id !== ch.id) {
-              setUnreadCounts(prev => ({
-                ...prev,
-                [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
-              }));
-
-              if (messageHasMentionForMe(msg)) {
-                setMentionCounts(prev => ({
+              if (msg.channel_id !== ch.id) {
+                setUnreadCounts(prev => ({
                   ...prev,
                   [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
                 }));
+
+                if (messageHasMentionForMe(msg)) {
+                  setMentionCounts(prev => ({
+                    ...prev,
+                    [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
+                  }));
+                }
+                return;
               }
-              return;
+              const { data: sender } = await supabase
+                .from("users").select("*").eq("id", msg.sender_id).single();
+              setMessages(prev => {
+                if (prev.find(m => m.id === msg.id)) return prev;
+                return [...prev, { ...msg, sender }];
+              });
+
+              // Update sidebar last-message preview for this channel
+              setChannelLastMsg(prev => ({
+                ...prev,
+                [msg.channel_id]: {
+                  senderName: sender?.full_name?.split(' ')[0] ?? 'Someone',
+                  text: stripHtmlForPreview(msg.content ?? '').slice(0, 50),
+                }
+              }));
             }
-            const { data: sender } = await supabase
-              .from("users").select("*").eq("id", msg.sender_id).single();
-            setMessages(prev => {
-              if (prev.find(m => m.id === msg.id)) return prev;
-              return [...prev, { ...msg, sender }];
+
+            if (payload.eventType === "UPDATE") {
+              const msg = payload.new as Message;
+              if (msg.channel_id !== ch.id) return;
+              setMessages(prev =>
+                prev.map(m => m.id === msg.id ? { ...m, ...msg } : m)
+              );
+            }
+
+            if (payload.eventType === "DELETE") {
+              setMessages(prev => prev.filter(m => m.id !== payload.old.id));
+            }
+          }
+        )
+        .subscribe();
+
+      // ── Realtime: watch ALL incoming DMs for sidebar badge ──
+      if (allDmSubRef.current) {
+        supabase.removeChannel(allDmSubRef.current);
+        allDmSubRef.current = null;
+      }
+
+      const allDmSub = supabase
+        .channel(`all-dm-watcher-${workspaceId}-${currentUserId}`)  // ✅ workspace-scoped
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "direct_messages",
+            filter: `receiver_id=eq.${currentUserId}`,  // Supabase only supports one filter — we guard workspace in handler
+          },
+          payload => {
+            const msg = payload.new as DM;
+            if (msg.workspace_id !== workspaceId) return; // ✅ ignore DMs from other workspaces
+
+            // Update sidebar last-message preview
+            const text = stripHtmlForPreview(msg.content ?? "").slice(0, 50);
+            setDmLastMsg(prev => ({ ...prev, [msg.sender_id]: { senderId: msg.sender_id, text } }));
+
+            // If user is already looking at this DM conversation, don't badge
+            if (msg.sender_id === currentUserId) return; // never badge own messages
+            if (msg.sender_id === activeDmUserIdRef.current) return; // already viewing
+            setDmUnreadCounts(prev => {
+              const updated = { ...prev, [msg.sender_id]: (prev[msg.sender_id] || 0) + 1 };
+              return updated;
             });
-
-            // Update sidebar last-message preview for this channel
-            setChannelLastMsg(prev => ({
-              ...prev,
-              [msg.channel_id]: {
-                senderName: sender?.full_name?.split(' ')[0] ?? 'Someone',
-                text: stripHtmlForPreview(msg.content ?? '').slice(0, 50),
-              }
-            }));
           }
+        )
+        .subscribe();
 
-          if (payload.eventType === "UPDATE") {
-            const msg = payload.new as Message;
-            if (msg.channel_id !== ch.id) return;
-            setMessages(prev =>
-              prev.map(m => m.id === msg.id ? { ...m, ...msg } : m)
-            );
-          }
+      allDmSubRef.current = allDmSub;
 
-          if (payload.eventType === "DELETE") {
-            setMessages(prev => prev.filter(m => m.id !== payload.old.id));
-          }
-        }
-      )
-      .subscribe();
-
-    // ── Realtime: watch ALL incoming DMs for sidebar badge ──
-    if (allDmSubRef.current) {
-      supabase.removeChannel(allDmSubRef.current);
-      allDmSubRef.current = null;
-    }
-
-    const allDmSub = supabase
-      .channel(`all-dm-watcher-${workspaceId}-${currentUserId}`)  // ✅ workspace-scoped
-      .on(
-        "postgres_changes",
-        {
+      // Realtime: new workspace member joined → mark DM list stale
+      const memberJoinSub = supabase
+        .channel(`workspace-members-${workspaceId}`)
+        .on("postgres_changes", {
           event: "INSERT",
           schema: "public",
-          table: "direct_messages",
-          filter: `receiver_id=eq.${currentUserId}`,  // Supabase only supports one filter — we guard workspace in handler
-        },
-        payload => {
-          const msg = payload.new as DM;
-          if (msg.workspace_id !== workspaceId) return; // ✅ ignore DMs from other workspaces
-
-          // Update sidebar last-message preview
-          const text = stripHtmlForPreview(msg.content ?? "").slice(0, 50);
-          setDmLastMsg(prev => ({ ...prev, [msg.sender_id]: { senderId: msg.sender_id, text } }));
-
-          // If user is already looking at this DM conversation, don't badge
-          if (msg.sender_id === currentUserId) return; // never badge own messages
-          if (msg.sender_id === activeDmUserIdRef.current) return; // already viewing
-          setDmUnreadCounts(prev => {
-            const updated = { ...prev, [msg.sender_id]: (prev[msg.sender_id] || 0) + 1 };
-            return updated;
-          });
-        }
-      )
-      .subscribe();
-
-    allDmSubRef.current = allDmSub;
-
-    // Realtime: new workspace member joined → mark DM list stale
-    const memberJoinSub = supabase
-      .channel(`workspace-members-${workspaceId}`)
-      .on("postgres_changes", {
-        event: "INSERT",
-        schema: "public",
-        table: "workspace_members",
-        filter: `workspace_id=eq.${workspaceId}`,
-      }, (payload) => {
-        const newMember = payload.new as any;
-        // Don't mark stale for yourself
-        if (newMember.user_id !== currentUserId) {
-          setMemberListStale(true);
-        }
-      })
-      .subscribe();
-
-    // Realtime: watch project updates for this workspace (color, name changes)
-    const projectsRealtime = supabase
-      .channel(`projects-realtime-${workspaceId}`)
-      .on('postgres_changes', {
-        event: 'UPDATE',
-        schema: 'public',
-        table: 'projects',
-        filter: `workspace_id=eq.${workspaceId}`,
-      }, (payload: any) => {
-        const updated = payload.new as Project;
-        // Update the project in the sidebar list
-        setProjects(prev =>
-          prev.map(p => p.id === updated.id ? { ...p, ...updated } : p)
-        );
-        // If this is the currently open project, sync the header too
-        setActiveProject(prev =>
-          prev?.id === updated.id ? { ...prev, ...updated } : prev
-        );
-      })
-      .on('postgres_changes', {
-        event: 'INSERT',
-        schema: 'public',
-        table: 'projects',
-        filter: `workspace_id=eq.${workspaceId}`,
-      }, (payload: any) => {
-        const newProject = payload.new as Project;
-        // Only add to sidebar if user is a member (public) or already has access
-        if (!newProject.is_private) {
-          setProjects(prev =>
-            prev.find(p => p.id === newProject.id) ? prev : [...prev, newProject]
-          );
-        }
-      })
-      .on('postgres_changes', {
-        event: 'DELETE',
-        schema: 'public',
-        table: 'projects',
-      }, (payload: any) => {
-        const deletedId = (payload.old as any).id;
-        setProjects(prev => prev.filter(p => p.id !== deletedId));
-        setActiveProject(prev => {
-          if (prev?.id === deletedId) {
-            setView('channel');
-            return null;
+          table: "workspace_members",
+          filter: `workspace_id=eq.${workspaceId}`,
+        }, (payload) => {
+          const newMember = payload.new as any;
+          // Don't mark stale for yourself
+          if (newMember.user_id !== currentUserId) {
+            setMemberListStale(true);
           }
-          return prev;
-        });
-      })
-      .subscribe();
+        })
+        .subscribe();
+
+      // Realtime: watch project updates for this workspace (color, name changes)
+      const projectsRealtime = supabase
+        .channel(`projects-realtime-${workspaceId}`)
+        .on('postgres_changes', {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'projects',
+          filter: `workspace_id=eq.${workspaceId}`,
+        }, (payload: any) => {
+          const updated = payload.new as Project;
+          // Update the project in the sidebar list
+          setProjects(prev =>
+            prev.map(p => p.id === updated.id ? { ...p, ...updated } : p)
+          );
+          // If this is the currently open project, sync the header too
+          setActiveProject(prev =>
+            prev?.id === updated.id ? { ...prev, ...updated } : prev
+          );
+        })
+        .on('postgres_changes', {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'projects',
+          filter: `workspace_id=eq.${workspaceId}`,
+        }, (payload: any) => {
+          const newProject = payload.new as Project;
+          // Only add to sidebar if user is a member (public) or already has access
+          if (!newProject.is_private) {
+            setProjects(prev =>
+              prev.find(p => p.id === newProject.id) ? prev : [...prev, newProject]
+            );
+          }
+        })
+        .on('postgres_changes', {
+          event: 'DELETE',
+          schema: 'public',
+          table: 'projects',
+        }, (payload: any) => {
+          const deletedId = (payload.old as any).id;
+          setProjects(prev => prev.filter(p => p.id !== deletedId));
+          setActiveProject(prev => {
+            if (prev?.id === deletedId) {
+              setView('channel');
+              return null;
+            }
+            return prev;
+          });
+        })
+        .subscribe();
 
       return () => {
         supabase.removeChannel(msgSub);
@@ -2669,18 +2782,13 @@ function WorkspacePage() {
   const loadChannelMessages = async (channelId: string) => {
     if (!me) return;
 
-    const channel =
-      activeChannel?.id === channelId
-        ? activeChannel
-        : channels.find((c) => c.id === channelId);
-
-    if (channel?.is_private) {
+    if (activeChannel?.is_private) {
       const { data: membership } = await supabase
         .from("channel_members")
         .select("channel_id")
         .eq("channel_id", channelId)
         .eq("user_id", me.id)
-        .single();
+        .maybeSingle();
 
       if (!membership) {
         setMessages([]);
@@ -2689,16 +2797,38 @@ function WorkspacePage() {
       }
     }
 
-    const { data } = await supabase
+    const { data: rawMessages, error } = await supabase
       .from("messages")
-      .select("*, sender:users(*)")
+      .select("*")
       .eq("channel_id", channelId)
       .order("created_at", { ascending: false })
       .limit(50);
 
-    const reversed = (data ?? []).reverse();
-    setMessages(reversed);
-    setHasMoreMessages((data ?? []).length === 50);
+    if (error) {
+      console.error("loadChannelMessages error", error);
+      setMessages([]);
+      return;
+    }
+
+    const msgs = rawMessages ?? [];
+    const senderIds = [...new Set(msgs.map((m: any) => m.sender_id).filter(Boolean))];
+
+    let senders: any[] = [];
+    if (senderIds.length > 0) {
+      const { data: senderData } = await supabase
+        .from("users")
+        .select("id, full_name, email, job_title, avatar_url")
+        .in("id", senderIds);
+      senders = senderData ?? [];
+    }
+
+    const senderMap = new Map(senders.map((u) => [u.id, u]));
+    const enriched = msgs
+      .map((m: any) => ({ ...m, sender: senderMap.get(m.sender_id) ?? null }))
+      .reverse();
+
+    setMessages(enriched);
+    setHasMoreMessages(msgs.length === 50);
   };
 
   const loadEarlierMessages = async () => {
@@ -2706,20 +2836,44 @@ function WorkspacePage() {
     setLoadingEarlier(true);
 
     const offset = messages.length;
-    const { data } = await supabase
+    const { data: rawMessages, error } = await supabase
       .from("messages")
-      .select("*, sender:users(*)")
+      .select("*")
       .eq("channel_id", activeChannel.id)
       .order("created_at", { ascending: false })
       .range(offset, offset + 49);
 
-    if (data && data.length > 0) {
-      const reversed = [...data].reverse();
-      setMessages(prev => [...reversed, ...prev]);
-      setHasMoreMessages(data.length === 50);
+    if (error) {
+      console.error("loadEarlierMessages error", error);
+      setLoadingEarlier(false);
+      return;
+    }
+
+    const msgs = rawMessages ?? [];
+
+    if (msgs.length > 0) {
+      const senderIds = [...new Set(msgs.map((m: any) => m.sender_id).filter(Boolean))];
+
+      let senders: any[] = [];
+      if (senderIds.length > 0) {
+        const { data: senderData } = await supabase
+          .from("users")
+          .select("id, full_name, email, job_title, avatar_url")
+          .in("id", senderIds);
+        senders = senderData ?? [];
+      }
+
+      const senderMap = new Map(senders.map((u) => [u.id, u]));
+      const enriched = msgs
+        .map((m: any) => ({ ...m, sender: senderMap.get(m.sender_id) ?? null }))
+        .reverse();
+
+      setMessages((prev) => [...enriched, ...prev]);
+      setHasMoreMessages(msgs.length === 50);
     } else {
       setHasMoreMessages(false);
     }
+
     setLoadingEarlier(false);
   };
 
@@ -2758,9 +2912,10 @@ function WorkspacePage() {
   };
 
   // ─── Open a DM conversation ───────────────────────────────
-  const openDm = async (userId: string, userProfile?: Profile | null) => {
+  const openDm = async (targetUserId: string, userProfile?: Profile | null) => {
+    if (!targetUserId || targetUserId === userId) return;
     setView("dm");
-    setActiveDmUserId(userId);
+    setActiveDmUserId(targetUserId);
     setActiveDmUser(userProfile || null);
     setDmMessages([]);
     setDmUnreadFromMessageId(null);
@@ -2768,27 +2923,27 @@ function WorkspacePage() {
 
     // Clear badge for this user
     setDmUnreadCounts(prev => {
-      return { ...prev, [userId]: 0 };
+      return { ...prev, [targetUserId]: 0 };
     });
 
     if (me?.id) {
-      markDMRead(me.id, userId, workspaceId);
+      markDMRead(me.id, targetUserId, workspaceId);
     }
 
     // Fetch the profile if not passed
     if (!userProfile) {
       const { data: p } = await supabase
-        .from("users").select("*").eq("id", userId).single();
+        .from("users").select("*").eq("id", targetUserId).single();
       setActiveDmUser(p);
     }
 
     // Update presence indicator for DM header
-    setIsOtherOnline(onlineUsers.has(userId));
-    const url = `/workspace/${workspaceId}?dm=${userId}`;
+    setIsOtherOnline(onlineUsers.has(targetUserId));
+    const url = `/workspace/${workspaceId}?dm=${targetUserId}`;
     router.replace(url, { scroll: false });
     localStorage.setItem(`trexaflow_last_${workspaceId}`, url);
 
-    if (me) await loadDmMessages(me.id, userId);
+    if (me) await loadDmMessages(me.id, targetUserId);
   };
 
   // ─── Load DM messages ─────────────────────────────────────
@@ -2817,10 +2972,28 @@ function WorkspacePage() {
     });
   };
 
-  const isSuperAdmin = me?.id === workspace?.owner_id;
-  const isWorkspaceAdmin = isSuperAdmin || members.find(m => m.user_id === me?.id)?.role === 'admin';
-  // Keep isAdmin as alias for backward compat with existing code
+  const workspaceOwnerId =
+    workspace?.owner_id ||
+    (workspace as any)?.ownerid ||
+    null;
+
+  const currentMeId =
+    me?.id ||
+    (me as any)?.user_id ||
+    (me as any)?.userid ||
+    userId ||
+    null;
+
+  const isWorkspaceAdmin =
+    !!currentMeId &&
+    (
+      workspaceOwnerId === currentMeId ||
+      members.some(m => m.user_id === currentMeId && m.role === 'admin')
+    );
+
+  const isSuperAdmin = !!currentMeId && workspaceOwnerId === currentMeId;
   const isAdmin = isWorkspaceAdmin;
+  const canShowWorkspaceControls = !!workspace && !!me && isWorkspaceAdmin;
 
   const isProjectCreator = !!activeProject && activeProject.created_by === me?.id;
   const myProjectMembership = projectMembers.find((pm) => pm.user_id === me?.id);
@@ -2878,63 +3051,111 @@ function WorkspacePage() {
     !!me && msg.sender_id === me.id;
 
   // ─── Load workspace members ───────────────────────────────
-  const loadMembers = async () => {
-    const { data: mems } = await supabase
+  const loadMembers = async (currentUserId?: string) => {
+    const uid = currentUserId ?? me?.id;
+    if (!uid) return;
+
+    const { data: memberRows, error: membersError } = await supabase
       .from("workspace_members")
       .select("user_id, role")
       .eq("workspace_id", workspaceId);
 
-    if (!mems) return;
+    if (membersError) {
+      console.error("loadMembers workspace_members error:", membersError);
+      setMembers([]);
+      setDmUnreadCounts({});
+      setDmLastMsg({});
+      return;
+    }
 
-    const profiles = await Promise.all(
-      mems.map(async (m: any) => {
-        const { data: p } = await supabase
-          .from("users").select("*").eq("id", m.user_id).single();
+    const otherMemberRows = (memberRows ?? []).filter((m: any) => m.user_id !== uid);
+    const memberIds = otherMemberRows.map((m: any) => m.user_id);
 
-        // Fetch last DM preview
-        if (meIdRef.current) {
-          const { data: lastMsg } = await supabase
-            .from("direct_messages")
-            .select("content, sender_id")
-            .or(`and(sender_id.eq.${meIdRef.current},receiver_id.eq.${m.user_id}),and(sender_id.eq.${m.user_id},receiver_id.eq.${meIdRef.current})`)
-            .eq("workspace_id", workspaceId)
-            .order("created_at", { ascending: false })
-            .limit(1)
-            .maybeSingle();
+    if (memberIds.length === 0) {
+      setMembers([]);
+      setDmUnreadCounts({});
+      setDmLastMsg({});
+      return;
+    }
 
-          if (lastMsg) {
-            const text = stripHtmlForPreview(lastMsg.content ?? "").slice(0, 50);
-            setDmLastMsg(prev => ({ ...prev, [m.user_id]: { senderId: lastMsg.sender_id, text } }));
-          }
+    const { data: profiles, error: profilesError } = await supabase
+      .from("users")
+      .select("*")
+      .in("id", memberIds);
 
-          // Fetch DM unread count from DB
-          const unreadCount = await getDMUnreadCount(meIdRef.current, m.user_id, workspaceId);
-          setDmUnreadCounts(prev => ({ ...prev, [m.user_id]: unreadCount }));
+    if (profilesError) {
+      console.error("loadMembers users error:", profilesError);
+      setMembers([]);
+      setDmUnreadCounts({});
+      setDmLastMsg({});
+      return;
+    }
+
+    const profileMap = new Map((profiles ?? []).map((p: any) => [p.id, p]));
+
+    const mergedMembers: Member[] = otherMemberRows
+      .map((m: any) => ({
+        user_id: m.user_id,
+        role: m.role,
+        profile: profileMap.get(m.user_id) ?? null,
+        is_online: onlineUsers.has(m.user_id),
+      }))
+      .filter((m) => m.profile);
+
+    setMembers(mergedMembers);
+
+    const unreadEntries = await Promise.all(
+      mergedMembers.map(async (member) => {
+        try {
+          const count = await getDMUnreadCount(uid, member.user_id, workspaceId);
+          return [member.user_id, count] as const;
+        } catch (err) {
+          console.error("getDMUnreadCount error for", member.user_id, err);
+          return [member.user_id, 0] as const;
         }
-
-        return { ...m, profile: p };
       })
     );
 
-    // Also fetch last message for Self-DM (Notes)
-    if (meIdRef.current) {
-      const { data: lastNote } = await supabase
-        .from("direct_messages")
-        .select("content, sender_id")
-        .eq("sender_id", meIdRef.current)
-        .eq("receiver_id", meIdRef.current)
-        .eq("workspace_id", workspaceId)
-        .order("created_at", { ascending: false })
-        .limit(1)
-        .maybeSingle();
+    setDmUnreadCounts(Object.fromEntries(unreadEntries));
 
-      if (lastNote) {
-        const text = stripHtmlForPreview(lastNote.content ?? "").slice(0, 50);
-        setDmLastMsg(prev => ({ ...prev, [meIdRef.current!]: { senderId: lastNote.sender_id, text } }));
-      }
-    }
+    const lastMessageEntries = await Promise.all(
+      mergedMembers.map(async (member) => {
+        try {
+          const { data, error } = await supabase
+            .from("direct_messages")
+            .select("id, sender_id, receiver_id, content, created_at, sender_name")
+            .eq("workspace_id", workspaceId)
+            .or(`and(sender_id.eq.${uid},receiver_id.eq.${member.user_id}),and(sender_id.eq.${member.user_id},receiver_id.eq.${uid})`)
+            .order("created_at", { ascending: false })
+            .limit(1);
 
-    setMembers(profiles);
+          if (error) {
+            console.error("loadMembers last DM error for", member.user_id, error);
+            return [member.user_id, null] as const;
+          }
+
+          const msg = data?.[0];
+          if (!msg) return [member.user_id, null] as const;
+
+          return [
+            member.user_id,
+            {
+              senderId: msg.sender_id,
+              text: stripHtmlForPreview(msg.content || ""),
+            },
+          ] as const;
+        } catch (err) {
+          console.error("loadMembers last DM fetch failed for", member.user_id, err);
+          return [member.user_id, null] as const;
+        }
+      })
+    );
+
+    setDmLastMsg(
+      Object.fromEntries(
+        lastMessageEntries.filter(([, value]) => value !== null)
+      ) as Record<string, { senderId: string; text: string }>
+    );
   };
 
   // ─── Load channel members ─────────────────────────────────
@@ -2958,119 +3179,79 @@ function WorkspacePage() {
   };
   // ─── Send channel message ─────────────────────────────────
   const sendMessage = async () => {
+    if (!activeChannel || !me || sending) return;
+
     const editorEl = editorRef.current;
-    if (!editorEl || !me || !activeChannel || sending || uploading) return;
-
-    if (!canAccessActiveChannel) {
-      showToast("You do not have access to send messages in this channel.", "error");
-      return;
-    }
-
-    const html = editorEl.innerHTML;
+    const html = editorEl?.innerHTML ?? newMessage;
     const content = sanitizeHtml(html);
-    if (!content.trim() && !attachmentFile) return;
 
-    editorEl.innerHTML = "";
-    setNewMessage("");
+    if (!content.trim()) return;
+
     setSending(true);
 
-    let attachData: { url: string; name: string; type: "image" | "file" } | null = null;
-    if (attachmentFile && attachmentBytes) {
-      setUploading(true);
-      attachData = await uploadToCloudinary(attachmentFile, attachmentBytes, showToast);
-      setUploading(false);
-
-      if (!attachData) {
-        editorEl.innerHTML = html;
-        setNewMessage(html);
-        setSending(false);
-        setAttachmentFile(null);
-        setAttachmentBytes(null);
-        setAttachmentPreview(null);
-        return;
-      }
-    }
-
-    setAttachmentFile(null);
-    setAttachmentBytes(null);
-    setAttachmentPreview(null);
-
     const optimisticId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    const optimisticMsg: Message = {
+
+    const optimistic: Message = {
       id: optimisticId,
       channel_id: activeChannel.id,
+      sender_id: me.id,
       content,
       created_at: new Date().toISOString(),
-      sender_id: me.id,
       is_pinned: false,
       is_system: false,
       sender: me,
-      attachment_url: attachData?.url ?? null,
-      attachment_name: attachData?.name ?? null,
-      attachment_type: attachData?.type ?? null,
-      parent_message_id: replyingTo?.id ?? null,
-      parent_snapshot: replyingTo
-        ? {
-            sendername: replyingTo.sender?.full_name ?? "Unknown",
-            content: replyingTo.content,
-          }
-        : null,
     };
 
-    setMessages((prev) => [...prev, optimisticMsg]);
+    if (editorEl) editorEl.innerHTML = "";
+    setNewMessage("");
+    newMessageRef.current = "";
+    setIsNewMessageEmpty(true);
+    setMessages((prev) => [...prev, optimistic]);
 
-    const { data: sent, error } = await supabase
-      .from("messages")
-      .insert({
-        channel_id: activeChannel.id,
-        sender_id: me.id,
-        content: content || null,
-        is_pinned: false,
-        is_system: false,
-        attachment_url: attachData?.url ?? null,
-        attachment_name: attachData?.name ?? null,
-        attachment_type: attachData?.type ?? null,
-        parent_message_id: replyingTo?.id ?? null,
-        parent_snapshot: replyingTo
-          ? {
-              sendername: replyingTo.sender?.full_name ?? "Unknown",
-              content: replyingTo.content,
-            }
-          : null,
-      })
-      .select("*, sender:users(*)")
-      .single();
+    try {
+      const { data, error } = await supabase
+        .from("messages")
+        .insert({
+          channel_id: activeChannel.id,
+          sender_id: me.id,
+          content,
+          is_pinned: false,
+        })
+        .select("*")
+        .single();
 
-    if (error) {
-      setMessages((prev) => prev.filter((m) => m.id !== optimisticMsg.id));
-      editorEl.innerHTML = html;
+      if (error) {
+        console.error("sendMessage error", error);
+        setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
+        if (editorEl) editorEl.innerHTML = html;
+        setNewMessage(html);
+        newMessageRef.current = html;
+        setIsNewMessageEmpty(false);
+        showToast("Failed to send message.", "error");
+        setSending(false);
+        return;
+      }
+
+      const insertedWithSender: Message = {
+        ...data,
+        sender: me,
+      };
+
+      setMessages((prev) =>
+        prev.map((m) => (m.id === optimisticId ? insertedWithSender : m))
+      );
+      setReplyingTo(null);
+    } catch (err) {
+      console.error("sendMessage unexpected error", err);
+      setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
+      if (editorEl) editorEl.innerHTML = html;
       setNewMessage(html);
-      setSending(false);
+      newMessageRef.current = html;
+      setIsNewMessageEmpty(false);
       showToast("Failed to send message.", "error");
-      return;
-    }
-
-    if (sent) {
-      setMessages((prev) => {
-        const withoutDupe = prev.filter((m) => m.id !== sent.id);
-        return withoutDupe.map((m) => (m.id === optimisticMsg.id ? sent : m));
-      });
     }
 
     setSending(false);
-    setReplyingTo(null);
-
-    setTimeout(() => {
-      if (editorRef.current) {
-        editorRef.current.focus();
-        const range = document.createRange();
-        range.selectNodeContents(editorRef.current);
-        range.collapse(false);
-        const sel = window.getSelection();
-        sel?.removeAllRanges();
-        sel?.addRange(range);
-      }
-    }, 0);
   };
 
   // ─── Send DM ──────────────────────────────────────────────
@@ -3580,18 +3761,43 @@ function WorkspacePage() {
       }
     }
 
-    const { data: updated } = await supabase
-      .from("users")
-      .update({
-        full_name: profileEditName.trim(),
-        job_title: profileEditRole.trim() || null,
-        avatar_url: avatarUrl,
-      })
-      .eq("id", userId)
-      .select()
-      .single();
+    const token = useAuthStore.getState().accessToken;
+    if (!token) {
+      setSavingProfile(false);
+      router.replace('/auth');
+      return;
+    }
 
-    if (updated) setMe(updated);
+    try {
+      const res = await fetch('/api/profile/save', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          fullName: profileEditName.trim(),
+          jobTitle: profileEditRole.trim(),
+          avatarUrl: avatarUrl,
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        showToast(errData.error || 'Failed to save profile on the server.', 'error');
+        setSavingProfile(false);
+        return;
+      }
+
+      const data = await res.json();
+      if (data.user) {
+        setMe(data.user);
+      }
+    } catch (err) {
+      console.error(err);
+      showToast('Something went wrong saving profile.', 'error');
+    }
+
     setSavingProfile(false);
     setEditingProfile(false);
     setProfileEditImageFile(null);
@@ -3818,7 +4024,10 @@ function WorkspacePage() {
       return;
     }
 
-    if (targetUserId === workspace.owner_id) {
+    const workspaceOwnerId =
+      workspace.owner_id || (workspace as any).ownerid;
+
+    if (targetUserId === workspaceOwnerId) {
       showToast("Workspace owner role cannot be changed.", "error");
       return;
     }
@@ -3865,7 +4074,11 @@ function WorkspacePage() {
       showToast('You do not have permission to change project roles.', 'error');
       return;
     }
-    if (targetUserId === activeProject?.created_by) {
+    const projectOwnerId =
+      activeProject?.created_by ||
+      (activeProject as any)?.createdby;
+
+    if (targetUserId === projectOwnerId) {
       showToast('The project creator role cannot be changed.', 'error');
       return;
     }
@@ -3893,7 +4106,10 @@ function WorkspacePage() {
       return;
     }
 
-    if (targetUserId === workspace.owner_id) {
+    const workspaceOwnerId =
+      workspace.owner_id || (workspace as any).ownerid;
+
+    if (targetUserId === workspaceOwnerId) {
       showToast("Workspace owner cannot be removed.", "error");
       return;
     }
@@ -3944,10 +4160,15 @@ function WorkspacePage() {
         .in('project_id', projectIds);
     }
 
-    setMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
-    setChannelMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
-    setNonChannelMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
-    setProjectMembers((prev) => prev.filter((m) => m.user_id !== targetUserId));
+    const notTarget = (m: any) =>
+      m.user_id !== targetUserId &&
+      m.id !== targetUserId &&
+      m.userid !== targetUserId;
+
+    setMembers((prev) => prev.filter(notTarget));
+    setChannelMembers((prev) => prev.filter(notTarget));
+    setNonChannelMembers((prev) => prev.filter(notTarget));
+    setProjectMembers((prev) => prev.filter(notTarget));
 
     showToast("Member removed from workspace.", "success");
   };
@@ -3956,7 +4177,10 @@ function WorkspacePage() {
   const leaveWorkspace = async () => {
     if (!me || !userId || !workspace) return;
 
-    if (workspace.owner_id === userId) {
+    const workspaceOwnerId =
+      workspace.owner_id || (workspace as any).ownerid;
+
+    if (workspaceOwnerId === userId) {
       showToast("Transfer workspace ownership before leaving.", "error");
       return;
     }
@@ -4016,7 +4240,7 @@ function WorkspacePage() {
       return;
     }
 
-    router.replace("/main/onboarding");
+    router.replace("/onboarding");
   };
 
   const handleAddWorkspace = async () => {
@@ -4024,85 +4248,78 @@ function WorkspacePage() {
     setAddWsError('');
     setAddWsLoading(true);
 
-    if (addWsMode === 'join') {
-      // Join by code
-      const { data: ws } = await supabase
-        .from('workspaces')
-        .select()
-        .eq('workspace_code', addWsJoinCode.trim().toUpperCase())
-        .single();
-
-      if (!ws) {
-        setAddWsLoading(false);
-        return setAddWsError('Workspace not found. Check the code and try again.');
-      }
-
-      // Check already a member
-      const { data: existing } = await supabase
-        .from('workspace_members')
-        .select('id')
-        .eq('workspace_id', ws.id)
-        .eq('user_id', me.id)
-        .single();
-
-      if (!existing) {
-        const { data: profile } = await supabase
-          .from('users')
-          .select('id')
-          .eq('id', me.id)
-          .single();
-
-        if (!profile) {
-          router.replace('/main/onboarding');
-          return;
-        }
-
-        await supabase.from('workspace_members').insert({ workspace_id: ws.id, user_id: me.id, role: 'member' });
-        // Auto-join public channels
-        const { data: pubChans } = await supabase.from('channels').select('id').eq('workspace_id', ws.id).eq('is_private', false);
-        if (pubChans?.length) {
-          await supabase.from('channel_members').insert(pubChans.map(ch => ({ channel_id: ch.id, user_id: me.id })));
-        }
-      }
-
+    const token = useAuthStore.getState().accessToken;
+    if (!token) {
       setAddWsLoading(false);
-      setShowAddWorkspace(false);
-      router.push(`/workspace/${ws.id}`);
+      router.replace('/auth');
+      return;
+    }
 
-    } else {
-      // Create new workspace
+    const apiFetch = async (url: string, options: RequestInit = {}) => {
+      return fetch(url, {
+        ...options,
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+          ...(options.headers || {}),
+        },
+      });
+    };
+
+    try {
+      if (addWsMode === 'join') {
+        if (!addWsJoinCode.trim()) {
+          setAddWsLoading(false);
+          return setAddWsError('Workspace code is required.');
+        }
+
+        const res = await apiFetch('/api/workspaces/join', {
+          method: 'POST',
+          body: JSON.stringify({
+            code: addWsJoinCode.trim().toUpperCase(),
+            fullName: me.full_name,
+          }),
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          setAddWsLoading(false);
+          return setAddWsError(data.error || 'Failed to join workspace.');
+        }
+
+        setAddWsLoading(false);
+        setShowAddWorkspace(false);
+        router.push(`/workspace/${data.workspace.id}`);
+        return;
+      }
+
       if (!addWsName.trim()) {
         setAddWsLoading(false);
         return setAddWsError('Please enter a workspace name.');
       }
 
-      const workspaceCode = Math.random().toString(36).substring(2, 10).toUpperCase();
-      const { data: newWs } = await supabase
-        .from('workspaces')
-        .insert({ name: addWsName.trim(), workspace_code: workspaceCode, owner_id: me.id })
-        .select()
-        .single();
+      const res = await apiFetch('/api/workspaces/create', {
+        method: 'POST',
+        body: JSON.stringify({
+          name: addWsName.trim(),
+          fullName: me.full_name,
+        }),
+      });
 
-      if (!newWs) {
+      const data = await res.json().catch(() => ({}));
+
+      if (!res.ok) {
         setAddWsLoading(false);
-        return setAddWsError('Failed to create workspace.');
-      }
-
-      await supabase.from('workspace_members').insert({ workspace_id: newWs.id, user_id: me.id, role: 'admin' });
-
-      const { data: lobby } = await supabase
-        .from('channels')
-        .insert({ workspace_id: newWs.id, name: 'lobby', description: 'Welcome!', is_private: false, created_by: me.id, is_default: true })
-        .select().single();
-
-      if (lobby) {
-        await supabase.from('channel_members').insert({ channel_id: lobby.id, user_id: me.id });
-        await supabase.from('messages').insert({ channel_id: lobby.id, sender_id: me.id, content: `${me.full_name} created this workspace. Welcome!`, is_pinned: false, is_system: true });
+        return setAddWsError(data.error || 'Failed to create workspace.');
       }
 
       setAddWsLoading(false);
       setShowAddWorkspace(false);
-      router.push(`/workspace/${newWs.id}`);
+      router.push(`/workspace/${data.workspace.id}`);
+    } catch {
+      setAddWsLoading(false);
+      setAddWsError('Something went wrong.');
     }
   };
   // ─── Helpers ──────────────────────────────────────────────
@@ -4939,11 +5156,11 @@ function WorkspacePage() {
               {workspace?.image_url
                 ? <img src={workspace.image_url} style={{ width: 22, height: 22, borderRadius: 6, objectFit: 'cover', flexShrink: 0 }} alt="" />
                 : <div style={{ width: 22, height: 22, borderRadius: 6, backgroundColor: '#E01E5A', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.65rem', fontWeight: 700, color: '#fff', flexShrink: 0 }}>
-                  {workspace?.name?.[0]?.toUpperCase()}
+                  {(workspace?.name || 'Untitled Workspace')?.[0]?.toUpperCase()}
                 </div>
               }
               <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>
-                {workspace?.name}
+                {workspace?.name || 'Untitled Workspace'}
               </span>
               <ChevronDown size={13} style={{ color: 'var(--text-muted)', flexShrink: 0 }} />
             </button>
@@ -5755,7 +5972,7 @@ function WorkspacePage() {
                           {msg.content}
                         </p>
                       </div>
-                      {me?.id === workspace?.owner_id && (
+                      {isSuperAdmin && (
                         <button onClick={() => togglePinMessage(msg)} title="Unpin"
                           style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", padding: "2px", flexShrink: 0 }}
                           onMouseEnter={e => e.currentTarget.style.color = "#f87171"}
@@ -5813,7 +6030,7 @@ function WorkspacePage() {
                               {m.profile?.full_name?.split(" ")[0]}
                             </span>
                             {(() => {
-                              const isOwner = m.user_id === workspace?.owner_id;
+                              const isOwner = m.user_id === workspaceOwnerId;
                               const roleLabel = isOwner ? "Owner" : m.role === "admin" ? "Admin" : null;
                               if (!roleLabel) return null;
                               return (
@@ -8276,7 +8493,7 @@ function WorkspacePage() {
                     {onlineUsers.has(showMemberProfile.user_id) ? "Online now" : "Offline"}
                   </span>
                   {(() => {
-                    const isOwner = showMemberProfile.user_id === workspace?.owner_id;
+                    const isOwner = showMemberProfile.user_id === workspaceOwnerId;
                     const memberWsRole = members.find(m => m.user_id === showMemberProfile.user_id)?.role;
                     const roleLabel = isOwner ? 'Owner' : memberWsRole === 'admin' ? 'Admin' : 'Member';
                     const roleColor = isOwner ? '#f59e0b' : memberWsRole === 'admin' ? '#E01E5A' : 'var(--text-muted)';
@@ -8453,7 +8670,7 @@ function WorkspacePage() {
                     )}
 
                     {channelMembers.map(m => {
-                      const isOwner = m.user_id === workspace?.owner_id;
+                      const isOwner = m.user_id === workspaceOwnerId;
                       const memberWsRole = members.find(wm => wm.user_id === m.user_id)?.role;
                       const roleLabel = isOwner ? 'Owner' : memberWsRole === 'admin' ? 'Admin' : 'Member';
                       const roleColor = isOwner ? '#f59e0b' : memberWsRole === 'admin' ? '#E01E5A' : 'var(--text-muted)';
@@ -9374,7 +9591,7 @@ function WorkspacePage() {
                     {taskSubtasks.filter(s => s.is_complete).length}/{taskSubtasks.length}
                   </span>
                 </div>
-                
+
                 {/* Subtask input */}
                 <div style={{ display: 'flex', gap: 6, marginBottom: 12 }}>
                   <input
