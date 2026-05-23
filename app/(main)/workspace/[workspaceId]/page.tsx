@@ -761,6 +761,7 @@ function WorkspacePage() {
   const dmSubRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const allDmSubRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const meIdRef = useRef<string | null>(null);
+  const channelsRef = useRef<Channel[]>([]);
 
   // ── Typing optimization ──
   const newMessageRef = useRef<string>('');
@@ -836,6 +837,10 @@ function WorkspacePage() {
   useEffect(() => {
     activeDmUserIdRef.current = activeDmUserId;
   }, [activeDmUserId]);
+
+  useEffect(() => {
+    channelsRef.current = channels;
+  }, [channels]);
 
   useEffect(() => {
     return () => {
@@ -2600,63 +2605,124 @@ function WorkspacePage() {
         })
         .subscribe();
 
-      // ── Realtime: channel messages ──
+      // ── Realtime: channel messages (per-user, workspace-scoped) ──
       const msgSub = supabase
-        .channel(`messages-${workspaceId}`)
+        .channel(`channel-messages-${workspaceId}-${currentUserId}`)
         .on(
           "postgres_changes",
-          { event: "*", schema: "public", table: "messages" },
-          async payload => {
-            const ch = activeChannelRef.current;
-            if (!ch) return;
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "messages",
+          },
+          async (payload) => {
+            const msg = payload.new as Message;
 
-            if (payload.eventType === "INSERT") {
-              const msg = payload.new as Message;
-              // Never badge or append your own messages
-              if (msg.sender_id === meIdRef.current && meIdRef.current !== null) return;
+            // Ignore messages from other workspaces (safety, if table is multi-workspace)
+            if ((msg as any).workspace_id && (msg as any).workspace_id !== workspaceId) return;
 
-              if (msg.channel_id !== ch.id) {
-                setUnreadCounts(prev => ({
-                  ...prev,
-                  [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
-                }));
+            // Skip own messages – handled optimistically in sendMessage
+            if (msg.sender_id === currentUserId) return;
 
-                if (messageHasMentionForMe(msg)) {
-                  setMentionCounts(prev => ({
-                    ...prev,
-                    [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
-                  }));
-                }
-                return;
-              }
-              const { data: sender } = await supabase
-                .from("users").select("*").eq("id", msg.sender_id).single();
-              setMessages(prev => {
-                if (prev.find(m => m.id === msg.id)) return prev;
+            // If channel is private, ensure this user is a member before showing anything
+            const channel = channelsRef.current.find((ch) => ch.id === msg.channel_id);
+            if (channel?.is_private) {
+              const { data: membership } = await supabase
+                .from("channel_members")
+                .select("channel_id")
+                .eq("channel_id", msg.channel_id)
+                .eq("user_id", currentUserId)
+                .maybeSingle();
+
+              if (!membership) return; // user has no access to this channel
+            }
+
+            // Fetch minimal sender info for sidebar + bubble avatar
+            const { data: senderData } = await supabase
+              .from("users")
+              .select("id, full_name, avatar_url")
+              .eq("id", msg.sender_id)
+              .single();
+            const sender = (senderData ?? undefined) as Profile | undefined;
+
+            // Sidebar last-message preview
+            setChannelLastMsg((prev) => ({
+              ...prev,
+              [msg.channel_id]: {
+                senderName: sender?.full_name?.split(" ")[0] ?? "Someone",
+                text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
+              },
+            }));
+
+            const isViewingThisChannel =
+              viewRef.current === "channel" &&
+              activeChannelRef.current?.id === msg.channel_id;
+
+            if (isViewingThisChannel) {
+              // Append live to currently open channel
+              setMessages((prev) => {
+                if (prev.find((m) => m.id === msg.id)) return prev;
                 return [...prev, { ...msg, sender }];
               });
 
-              // Update sidebar last-message preview for this channel
-              setChannelLastMsg(prev => ({
+              requestAnimationFrame(() => {
+                const container = document.getElementById("channel-messages-container");
+                if (container) container.scrollTop = container.scrollHeight;
+              });
+
+              // Mark as read for this user
+              markChannelRead(msg.channel_id, currentUserId);
+            } else {
+              // User is elsewhere – increment unread + mention badge
+              setUnreadCounts((prev) => ({
                 ...prev,
-                [msg.channel_id]: {
-                  senderName: sender?.full_name?.split(' ')[0] ?? 'Someone',
-                  text: stripHtmlForPreview(msg.content ?? '').slice(0, 50),
-                }
+                [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
               }));
+              if (messageHasMentionForMe(msg)) {
+                setMentionCounts((prev) => ({
+                  ...prev,
+                  [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
+                }));
+              }
             }
+          }
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "messages",
+          },
+          (payload) => {
+            const msg = payload.new as Message;
+            if (activeChannelRef.current?.id !== msg.channel_id) return;
 
-            if (payload.eventType === "UPDATE") {
-              const msg = payload.new as Message;
-              if (msg.channel_id !== ch.id) return;
-              setMessages(prev =>
-                prev.map(m => m.id === msg.id ? { ...m, ...msg } : m)
-              );
-            }
+            setMessages((prev) =>
+              prev.map((m) => (m.id === msg.id ? { ...m, ...msg } : m))
+            );
 
-            if (payload.eventType === "DELETE") {
-              setMessages(prev => prev.filter(m => m.id !== payload.old.id));
-            }
+            // Keep last-message preview up to date on edits
+            setChannelLastMsg((prev) => ({
+              ...prev,
+              [msg.channel_id]: {
+                senderName: prev[msg.channel_id]?.senderName ?? "Someone",
+                text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
+              },
+            }));
+          }
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "DELETE",
+            schema: "public",
+            table: "messages",
+          },
+          (payload) => {
+            const deleted = payload.old as any;
+            if (activeChannelRef.current?.id !== deleted.channel_id) return;
+            setMessages((prev) => prev.filter((m) => m.id !== deleted.id));
           }
         )
         .subscribe();
@@ -3123,9 +3189,11 @@ function WorkspacePage() {
         try {
           const { data, error } = await supabase
             .from("direct_messages")
-            .select("id, sender_id, receiver_id, content, created_at, sender_name")
+            .select("id, sender_id, receiver_id, content, created_at")
             .eq("workspace_id", workspaceId)
-            .or(`and(sender_id.eq.${uid},receiver_id.eq.${member.user_id}),and(sender_id.eq.${member.user_id},receiver_id.eq.${uid})`)
+            .or(
+              `and(sender_id.eq.${uid},receiver_id.eq.${member.user_id}),and(sender_id.eq.${member.user_id},receiver_id.eq.${uid})`
+            )
             .order("created_at", { ascending: false })
             .limit(1);
 
@@ -3141,7 +3209,7 @@ function WorkspacePage() {
             member.user_id,
             {
               senderId: msg.sender_id,
-              text: stripHtmlForPreview(msg.content || ""),
+              text: stripHtmlForPreview(msg.content || "").slice(0, 50),
             },
           ] as const;
         } catch (err) {
@@ -5987,7 +6055,7 @@ function WorkspacePage() {
               )}
 
               {/* Channel messages */}
-              <div ref={messagesContainerRef} style={{ flex: 1, overflowY: "auto", padding: "20px 20px 0" }}>
+              <div id="channel-messages-container" ref={messagesContainerRef} style={{ flex: 1, overflowY: "auto", padding: "20px 20px 0" }}>
 
                 {/* Lobby welcome header */}
                 {isLobby && (
