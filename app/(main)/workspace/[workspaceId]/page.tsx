@@ -464,6 +464,7 @@ function WorkspacePage() {
   const [newChannelDesc, setNewChannelDesc] = useState("");
   const [newChannelPrivate, setNewChannelPrivate] = useState(false);
   const [creatingChannel, setCreatingChannel] = useState(false);
+  const [selectedChannelMemberIds, setSelectedChannelMemberIds] = useState<string[]>([]);
 
   // ── Channel settings ──
   const [showChannelSettings, setShowChannelSettings] = useState(false);
@@ -4300,15 +4301,19 @@ function WorkspacePage() {
     }
 
     if (newChannelPrivate) {
-      const { error: ownerJoinError } = await supabase
-        .from("channel_members")
-        .upsert(
-          [{ channel_id: chan.id, user_id: creatorId }],
-          { onConflict: "channel_id,user_id" }
-        );
+      const memberIds = Array.from(new Set([creatorId, ...selectedChannelMemberIds]));
 
-      if (ownerJoinError) {
-        console.error("private channel owner auto-join failed:", ownerJoinError);
+      const memberRows = memberIds.map((userId) => ({
+        channel_id: chan.id,
+        user_id: userId,
+      }));
+
+      const { error: memberErr } = await supabase
+        .from("channel_members")
+        .upsert(memberRows, { onConflict: "channel_id,user_id" });
+
+      if (memberErr) {
+        console.error("private channel member insert error:", memberErr);
       }
     } else {
       const { data: wsMembers, error: wsMembersError } = await supabase
@@ -4351,6 +4356,7 @@ function WorkspacePage() {
     setNewChannelName("");
     setNewChannelDesc("");
     setNewChannelPrivate(false);
+    setSelectedChannelMemberIds([]);
   };
 
   // ─── Create channel ───────────────────────────────────────
@@ -5777,7 +5783,7 @@ function WorkspacePage() {
                   </div>
                   {/* Add channel */}
                   {isAdmin && (
-                    <button onClick={() => setShowCreateChannel(true)} title="Create channel"
+                    <button onClick={() => { setShowCreateChannel(true); setSelectedChannelMemberIds([]); }} title="Create channel"
                       style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-muted)', padding: '2px 4px', borderRadius: 4, display: 'flex', alignItems: 'center' }}
                       onMouseEnter={e => e.currentTarget.style.color = 'var(--text-primary)'}
                       onMouseLeave={e => e.currentTarget.style.color = 'var(--text-muted)'}>
@@ -8598,13 +8604,13 @@ function WorkspacePage() {
         {/* ── CREATE CHANNEL MODAL ── */}
         {showCreateChannel && (
           <div
-            onClick={e => { if (e.target === e.currentTarget) setShowCreateChannel(false); }}
+            onClick={e => { if (e.target === e.currentTarget) { setShowCreateChannel(false); setSelectedChannelMemberIds([]); } }}
             style={{ position: "fixed", inset: 0, backgroundColor: "rgba(0,0,0,0.55)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, backdropFilter: "blur(4px)", padding: 20, animation: "fadeIn 0.15s ease" }}
           >
             <div style={{ backgroundColor: "var(--bg-secondary)", borderRadius: 16, width: "100%", maxWidth: 440, padding: 28, boxShadow: "0 24px 64px rgba(0,0,0,0.4)", border: "1px solid var(--border-color)", animation: "slideUp 0.2s ease" }}>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 22 }}>
                 <h2 style={{ fontSize: "1.05rem", fontWeight: 700, color: "var(--text-primary)" }}>Create a channel</h2>
-                <button onClick={() => setShowCreateChannel(false)} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", padding: 4 }}><X size={18} /></button>
+                <button onClick={() => { setShowCreateChannel(false); setSelectedChannelMemberIds([]); }} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", padding: 4 }}><X size={18} /></button>
               </div>
 
               <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -8656,6 +8662,84 @@ function WorkspacePage() {
                     <div style={{ position: "absolute", top: 2, left: newChannelPrivate ? 18 : 2, width: 16, height: 16, borderRadius: "50%", backgroundColor: "#fff", transition: "left 0.2s", boxShadow: "0 1px 3px rgba(0,0,0,0.3)" }} />
                   </div>
                 </div>
+
+                {/* Private channel member selection list */}
+                {newChannelPrivate && (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 4 }}>
+                    <label style={{ fontSize: "0.78rem", fontWeight: 600, color: "var(--text-muted)", display: "block", textTransform: "uppercase", letterSpacing: "0.05em" }}>
+                      Invite members <span style={{ fontWeight: 400, textTransform: "none" }}>(optional)</span>
+                    </label>
+                    <div style={{
+                      maxHeight: 180,
+                      overflowY: "auto",
+                      border: "1px solid var(--border-color)",
+                      borderRadius: 10,
+                      backgroundColor: "var(--bg-tertiary)",
+                      padding: "6px 12px"
+                    }}>
+                      {members
+                        .filter(m => m.user_id !== me?.id)
+                        .map(m => {
+                          const isSelected = selectedChannelMemberIds.includes(m.user_id);
+                          return (
+                            <div
+                              key={m.user_id}
+                              onClick={() => {
+                                setSelectedChannelMemberIds(prev =>
+                                  prev.includes(m.user_id)
+                                    ? prev.filter(id => id !== m.user_id)
+                                    : [...prev, m.user_id]
+                                );
+                              }}
+                              style={{
+                                display: "flex",
+                                alignItems: "center",
+                                gap: 12,
+                                padding: "8px 10px",
+                                cursor: "pointer",
+                                borderBottom: "1px solid var(--border-color)",
+                                borderRadius: 6,
+                                transition: "all 0.15s"
+                              }}
+                              onMouseEnter={e => e.currentTarget.style.backgroundColor = "var(--bg-active)"}
+                              onMouseLeave={e => e.currentTarget.style.backgroundColor = "transparent"}
+                            >
+                              <Avatar profile={m.profile} size={28} />
+                              <div style={{ flex: 1 }}>
+                                <div style={{ fontSize: "0.85rem", fontWeight: 600, color: "var(--text-primary)" }}>
+                                  {m.profile?.full_name}
+                                </div>
+                                {m.profile?.job_title && (
+                                  <div style={{ fontSize: "0.72rem", color: "var(--text-muted)" }}>
+                                    {m.profile?.job_title}
+                                  </div>
+                                )}
+                              </div>
+                              <div style={{
+                                width: 18,
+                                height: 18,
+                                borderRadius: 4,
+                                border: isSelected ? "none" : "2px solid var(--text-muted)",
+                                backgroundColor: isSelected ? "#E01E5A" : "transparent",
+                                display: "flex",
+                                alignItems: "center",
+                                justifyContent: "center",
+                                transition: "all 0.15s",
+                                flexShrink: 0
+                              }}>
+                                {isSelected && <Check size={12} color="#fff" strokeWidth={3} />}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      {members.filter(m => m.user_id !== me?.id).length === 0 && (
+                        <div style={{ padding: "12px 0", textAlign: "center", fontSize: "0.82rem", color: "var(--text-muted)" }}>
+                          No other workspace members to invite.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 <button
                   onClick={createChannel}
