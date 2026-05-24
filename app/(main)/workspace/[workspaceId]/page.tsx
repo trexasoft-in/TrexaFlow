@@ -400,6 +400,7 @@ function WorkspacePage() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [channels, setChannels] = useState<Channel[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
+  const [myWorkspaceRole, setMyWorkspaceRole] = useState<"admin" | "member">("member");
   const [activeChannel, setActiveChannel] = useState<Channel | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
@@ -2927,33 +2928,31 @@ function WorkspacePage() {
             filter: `workspace_id=eq.${workspaceId}`,
           },
           (payload) => {
-            const updated = payload.new as { user_id: string; role: "admin" | "member" }
+            const updated = payload.new as { user_id: string; role: "admin" | "member" };
+
+            if (updated.user_id === meIdRef.current) {
+              setMyWorkspaceRole(updated.role);
+            }
 
             setMembers((prev) =>
               prev.map((m) =>
-                m.user_id === updated.user_id
-                  ? { ...m, role: updated.role }
-                  : m
+                m.user_id === updated.user_id ? { ...m, role: updated.role } : m
               )
-            )
+            );
 
             // Keep channel member drawer in sync where role is shown
             setChannelMembers((prev) =>
               prev.map((m: any) =>
-                m.user_id === updated.user_id
-                  ? { ...m, role: updated.role }
-                  : m
+                m.user_id === updated.user_id ? { ...m, role: updated.role } : m
               )
-            )
+            );
 
             // Keep project member-derived views consistent if needed
             setNonChannelMembers((prev) =>
               prev.map((m: any) =>
-                m.user_id === updated.user_id
-                  ? { ...m, role: updated.role }
-                  : m
+                m.user_id === updated.user_id ? { ...m, role: updated.role } : m
               )
-            )
+            );
           }
         )
         .on(
@@ -3260,7 +3259,7 @@ function WorkspacePage() {
     !!currentMeId &&
     (
       workspaceOwnerId === currentMeId ||
-      members.some(m => m.user_id === currentMeId && m.role === 'admin')
+      myWorkspaceRole === "admin"
     );
 
   const isSuperAdmin = !!currentMeId && workspaceOwnerId === currentMeId;
@@ -3338,15 +3337,21 @@ function WorkspacePage() {
       .eq("workspace_id", workspaceId);
 
     if (membersError) {
-      console.error("loadMembers workspace_members error:", membersError);
+      console.error("loadMembers workspace_members error", membersError);
       setMembers([]);
       setDmUnreadCounts({});
       setDmLastMsg({});
+      setMyWorkspaceRole("member");
       return;
     }
 
-    const otherMemberRows = (memberRows ?? []).filter((m: any) => m.user_id !== uid);
-    const memberIds = otherMemberRows.map((m: any) => m.user_id);
+    const allRows = (memberRows ?? []) as Array<{ user_id: string; role: "admin" | "member" }>;
+
+    const myRow = allRows.find((m) => m.user_id === uid);
+    setMyWorkspaceRole(myRow?.role === "admin" ? "admin" : "member");
+
+    const otherMemberRows = allRows.filter((m) => m.user_id !== uid);
+    const memberIds = otherMemberRows.map((m) => m.user_id);
 
     if (memberIds.length === 0) {
       setMembers([]);
@@ -3361,7 +3366,7 @@ function WorkspacePage() {
       .in("id", memberIds);
 
     if (profilesError) {
-      console.error("loadMembers users error:", profilesError);
+      console.error("loadMembers users error", profilesError);
       setMembers([]);
       setDmUnreadCounts({});
       setDmLastMsg({});
@@ -3371,7 +3376,7 @@ function WorkspacePage() {
     const profileMap = new Map((profiles ?? []).map((p: any) => [p.id, p]));
 
     const mergedMembers: Member[] = otherMemberRows
-      .map((m: any) => ({
+      .map((m) => ({
         user_id: m.user_id,
         role: m.role,
         profile: profileMap.get(m.user_id) ?? null,
@@ -3392,7 +3397,6 @@ function WorkspacePage() {
         }
       })
     );
-
     setDmUnreadCounts(Object.fromEntries(unreadEntries));
 
     const lastMessageEntries = await Promise.all(
@@ -3420,7 +3424,7 @@ function WorkspacePage() {
             member.user_id,
             {
               senderId: msg.sender_id,
-              text: stripHtmlForPreview(msg.content || "").slice(0, 50),
+              text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
             },
           ] as const;
         } catch (err) {
@@ -3431,9 +3435,10 @@ function WorkspacePage() {
     );
 
     setDmLastMsg(
-      Object.fromEntries(
-        lastMessageEntries.filter(([, value]) => value !== null)
-      ) as Record<string, { senderId: string; text: string }>
+      Object.fromEntries(lastMessageEntries.filter(([, value]) => value !== null)) as Record<
+        string,
+        { senderId: string; text: string }
+      >
     );
   };
 
@@ -3462,7 +3467,7 @@ function WorkspacePage() {
           ? [
             {
               user_id: me.id,
-              role: workspace?.owner_id === me.id ? "admin" : "member",
+              role: workspace?.owner_id === me.id ? "admin" : myWorkspaceRole,
               profile: me,
               is_online: onlineUsers.has(me.id),
             } as any,
@@ -3493,7 +3498,7 @@ function WorkspacePage() {
           ? [
             {
               user_id: me.id,
-              role: workspace?.owner_id === me.id ? "admin" : "member",
+              role: workspace?.owner_id === me.id ? "admin" : myWorkspaceRole,
               profile: me,
               is_online: onlineUsers.has(me.id),
             },
@@ -3523,7 +3528,7 @@ function WorkspacePage() {
         ? [
           {
             user_id: me.id,
-            role: workspace?.owner_id === me.id ? "admin" : "member",
+            role: workspace?.owner_id === me.id ? "admin" : myWorkspaceRole,
             profile: me,
             is_online: onlineUsers.has(me.id),
           },
@@ -4507,6 +4512,10 @@ function WorkspacePage() {
         m.user_id === targetUserId ? { ...m, role: newRole } : m
       )
     );
+
+    if (targetUserId === me?.id) {
+      setMyWorkspaceRole(newRole);
+    }
 
     showToast(`Role updated to ${newRole === "admin" ? "Admin" : "Member"}.`, "success");
   };
@@ -8938,7 +8947,7 @@ function WorkspacePage() {
                   </span>
                   {(() => {
                     const isOwner = showMemberProfile.user_id === workspaceOwnerId;
-                    const memberWsRole = members.find(m => m.user_id === showMemberProfile.user_id)?.role;
+                    const memberWsRole = showMemberProfile.user_id === me?.id ? myWorkspaceRole : members.find(m => m.user_id === showMemberProfile.user_id)?.role;
                     const roleLabel = isOwner ? 'Owner' : memberWsRole === 'admin' ? 'Admin' : 'Member';
                     const roleColor = isOwner ? '#f59e0b' : memberWsRole === 'admin' ? '#E01E5A' : 'var(--text-muted)';
                     const roleBg = isOwner ? 'rgba(245,158,11,0.1)' : memberWsRole === 'admin' ? 'rgba(224,30,90,0.1)' : 'var(--bg-hover)';
@@ -9115,7 +9124,7 @@ function WorkspacePage() {
 
                     {channelMembers.map(m => {
                       const isOwner = m.user_id === workspaceOwnerId;
-                      const memberWsRole = members.find(wm => wm.user_id === m.user_id)?.role;
+                      const memberWsRole = m.user_id === me?.id ? myWorkspaceRole : m.role;
                       const roleLabel = isOwner ? 'Owner' : memberWsRole === 'admin' ? 'Admin' : 'Member';
                       const roleColor = isOwner ? '#f59e0b' : memberWsRole === 'admin' ? '#E01E5A' : 'var(--text-muted)';
                       const roleBg = isOwner ? 'rgba(245,158,11,0.1)' : memberWsRole === 'admin' ? 'rgba(224,30,90,0.1)' : 'var(--bg-hover)';
