@@ -1162,6 +1162,8 @@ function WorkspacePage() {
     };
   }, [workspaceId, activeChannel?.id, me?.id, view]);
 
+
+
   // Refresh only the channels list
   const refreshChannels = async () => {
     if (!me || refreshingChannels) return;
@@ -2730,22 +2732,31 @@ function WorkspacePage() {
             filter: `workspace_id=eq.${workspaceId}`,
           },
           async (payload) => {
-            const msg = payload.new as Message
+            const msg = payload.new as Message;
 
-            if (msg.sender_id === currentUserId) return
+            // 1) Skip own messages; sendMessage already updates UI for the sender
+            if (msg.sender_id === currentUserId) return;
 
-            const isOpenNow =
+            // 2) Only handle channel messages (ignore project/system etc. if they share table)
+            if (!msg.channel_id) return;
+
+            // 3) Check if this user currently has that channel open
+            const isChannelCurrentlyOpen =
               viewRef.current === "channel" &&
-              activeChannelRef.current?.id === msg.channel_id
+              activeChannelRef.current?.id === msg.channel_id;
 
-            let sender: Profile | undefined = undefined
-            const { data: senderData } = await supabase
+            // 4) Update sidebar last-message preview for everyone (owner + members)
+            let sender: Profile | undefined = undefined;
+            const { data: senderData, error: senderErr } = await supabase
               .from("users")
               .select("id, full_name, avatar_url, email, job_title")
               .eq("id", msg.sender_id)
-              .maybeSingle()
+              .maybeSingle();
 
-            if (senderData) sender = senderData as Profile
+            if (senderErr) {
+              console.error("channel sidebar sender fetch failed:", senderErr);
+            }
+            if (senderData) sender = senderData as Profile;
 
             setChannelLastMsg((prev) => ({
               ...prev,
@@ -2753,22 +2764,26 @@ function WorkspacePage() {
                 senderName: sender?.full_name?.split(" ")[0] ?? "Someone",
                 text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
               },
-            }))
+            }));
 
-            if (isOpenNow) {
-              return
+            // 5) If this channel is open for THIS user, we don't increment unread here.
+            //    The active-channel subscription + markChannelRead manage unread for open channel.
+            if (isChannelCurrentlyOpen) {
+              return;
             }
 
+            // 6) For all other channels (not currently open), bump unread counter for THIS user
             setUnreadCounts((prev) => ({
               ...prev,
               [msg.channel_id]: (prev[msg.channel_id] ?? 0) + 1,
-            }))
+            }));
 
+            // 7) Mentions badge for THIS user
             if (messageHasMentionForMe(msg)) {
               setMentionCounts((prev) => ({
                 ...prev,
                 [msg.channel_id]: (prev[msg.channel_id] ?? 0) + 1,
-              }))
+              }));
             }
           }
         )
@@ -2780,22 +2795,17 @@ function WorkspacePage() {
             table: "messages",
             filter: `workspace_id=eq.${workspaceId}`,
           },
-          async (payload) => {
-            const msg = payload.new as Message
+          (payload) => {
+            const msg = payload.new as Message;
 
+            // Only sidebar last-message text; open channel itself handled by active-channel listener
             setChannelLastMsg((prev) => ({
               ...prev,
               [msg.channel_id]: {
                 senderName: prev[msg.channel_id]?.senderName ?? "Someone",
                 text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
               },
-            }))
-
-            if (activeChannelRef.current?.id !== msg.channel_id) return
-
-            setMessages((prev) =>
-              prev.map((m) => (m.id === msg.id ? { ...m, ...msg } : m))
-            )
+            }));
           }
         )
         .on(
@@ -2807,15 +2817,18 @@ function WorkspacePage() {
             filter: `workspace_id=eq.${workspaceId}`,
           },
           (payload) => {
-            const deleted = payload.old as Message
+            const deleted = payload.old as Message;
 
+            // If the last message for a channel was deleted, the sidebar may show stale preview,
+            // but we deliberately leave messages & active view to the active-channel sub.
             if (activeChannelRef.current?.id === deleted.channel_id) {
-              setMessages((prev) => prev.filter((m) => m.id !== deleted.id))
+              // active-channel DELETE handler already updates setMessages
+              return;
             }
           }
         )
         .subscribe((status) => {
-          console.log("channel messages realtime status:", status)
+          console.log("channel sidebar realtime status:", status);
         });
 
       // ── Realtime: watch ALL incoming DMs for sidebar badge ──
@@ -2858,19 +2871,108 @@ function WorkspacePage() {
       // Realtime: new workspace member joined → mark DM list stale
       const memberJoinSub = supabase
         .channel(`workspace-members-${workspaceId}`)
-        .on("postgres_changes", {
-          event: "INSERT",
-          schema: "public",
-          table: "workspace_members",
-          filter: `workspace_id=eq.${workspaceId}`,
-        }, (payload) => {
-          const newMember = payload.new as any;
-          // Don't mark stale for yourself
-          if (newMember.user_id !== currentUserId) {
-            setMemberListStale(true);
+        .on(
+          "postgres_changes",
+          {
+            event: "INSERT",
+            schema: "public",
+            table: "workspace_members",
+            filter: `workspace_id=eq.${workspaceId}`,
+          },
+          async (payload) => {
+            const newMember = payload.new as { user_id: string; role: "admin" | "member" }
+
+            // Don't mark stale for yourself
+            if (newMember.user_id !== currentUserId) {
+              setMemberListStale(true)
+            }
+
+            // Try to hydrate immediately so sidebar/member list updates live
+            const { data: profile } = await supabase
+              .from("users")
+              .select("*")
+              .eq("id", newMember.user_id)
+              .maybeSingle()
+
+            if (profile) {
+              setMembers((prev) => {
+                const exists = prev.some((m) => m.user_id === newMember.user_id)
+                if (exists) return prev.map((m) =>
+                  m.user_id === newMember.user_id
+                    ? { ...m, role: newMember.role, profile }
+                    : m
+                )
+
+                return [
+                  ...prev,
+                  {
+                    user_id: newMember.user_id,
+                    role: newMember.role,
+                    profile,
+                    is_online: onlineUsers.has(newMember.user_id),
+                  } as any,
+                ]
+              })
+            } else {
+              setMemberListStale(true)
+            }
           }
-        })
-        .subscribe();
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "UPDATE",
+            schema: "public",
+            table: "workspace_members",
+            filter: `workspace_id=eq.${workspaceId}`,
+          },
+          (payload) => {
+            const updated = payload.new as { user_id: string; role: "admin" | "member" }
+
+            setMembers((prev) =>
+              prev.map((m) =>
+                m.user_id === updated.user_id
+                  ? { ...m, role: updated.role }
+                  : m
+              )
+            )
+
+            // Keep channel member drawer in sync where role is shown
+            setChannelMembers((prev) =>
+              prev.map((m: any) =>
+                m.user_id === updated.user_id
+                  ? { ...m, role: updated.role }
+                  : m
+              )
+            )
+
+            // Keep project member-derived views consistent if needed
+            setNonChannelMembers((prev) =>
+              prev.map((m: any) =>
+                m.user_id === updated.user_id
+                  ? { ...m, role: updated.role }
+                  : m
+              )
+            )
+          }
+        )
+        .on(
+          "postgres_changes",
+          {
+            event: "DELETE",
+            schema: "public",
+            table: "workspace_members",
+            filter: `workspace_id=eq.${workspaceId}`,
+          },
+          (payload) => {
+            const removed = payload.old as { user_id: string }
+
+            setMembers((prev) => prev.filter((m) => m.user_id !== removed.user_id))
+            setChannelMembers((prev) => prev.filter((m: any) => m.user_id !== removed.user_id))
+            setNonChannelMembers((prev) => prev.filter((m: any) => m.user_id !== removed.user_id))
+          }
+        )
+        .subscribe()
 
       // Realtime: watch project updates for this workspace (color, name changes)
       const projectsRealtime = supabase
@@ -3074,16 +3176,20 @@ function WorkspacePage() {
 
   // ─── Open a DM conversation ───────────────────────────────
   const openDm = async (targetUserId: string, userProfile?: Profile | null) => {
-    if (!targetUserId || targetUserId === userId) return;
+    if (!targetUserId) return;
+
+    const isSelfDm = targetUserId === userId;
+
     setView("dm");
     setActiveDmUserId(targetUserId);
     setActiveDmUser(userProfile || null);
+    setActiveChannel(null);
     setDmMessages([]);
     setDmUnreadFromMessageId(null);
     setDmUnreadCount(0);
 
     // Clear badge for this user
-    setDmUnreadCounts(prev => {
+    setDmUnreadCounts((prev) => {
       return { ...prev, [targetUserId]: 0 };
     });
 
@@ -3094,12 +3200,17 @@ function WorkspacePage() {
     // Fetch the profile if not passed
     if (!userProfile) {
       const { data: p } = await supabase
-        .from("users").select("*").eq("id", targetUserId).single();
+        .from("users")
+        .select("*")
+        .eq("id", targetUserId)
+        .single();
+
       setActiveDmUser(p);
     }
 
-    // Update presence indicator for DM header
-    setIsOtherOnline(onlineUsers.has(targetUserId));
+    // Self-DM should show self as online in header as well
+    setIsOtherOnline(isSelfDm ? true : onlineUsers.has(targetUserId));
+
     const url = `/workspace/${workspaceId}?dm=${targetUserId}`;
     router.replace(url, { scroll: false });
     localStorage.setItem(`trexaflow_last_${workspaceId}`, url);
@@ -3349,14 +3460,14 @@ function WorkspacePage() {
       setNonChannelMembers(
         me
           ? [
-              {
-                user_id: me.id,
-                role: workspace?.owner_id === me.id ? "admin" : "member",
-                profile: me,
-                is_online: onlineUsers.has(me.id),
-              } as any,
-              ...members,
-            ]
+            {
+              user_id: me.id,
+              role: workspace?.owner_id === me.id ? "admin" : "member",
+              profile: me,
+              is_online: onlineUsers.has(me.id),
+            } as any,
+            ...members,
+          ]
           : members
       );
       return;
@@ -3380,13 +3491,13 @@ function WorkspacePage() {
       [
         ...(me
           ? [
-              {
-                user_id: me.id,
-                role: workspace?.owner_id === me.id ? "admin" : "member",
-                profile: me,
-                is_online: onlineUsers.has(me.id),
-              },
-            ]
+            {
+              user_id: me.id,
+              role: workspace?.owner_id === me.id ? "admin" : "member",
+              profile: me,
+              is_online: onlineUsers.has(me.id),
+            },
+          ]
           : []),
         ...members,
       ].map((m: any) => [m.user_id, m])
@@ -3410,13 +3521,13 @@ function WorkspacePage() {
     const allWorkspacePeople = [
       ...(me
         ? [
-            {
-              user_id: me.id,
-              role: workspace?.owner_id === me.id ? "admin" : "member",
-              profile: me,
-              is_online: onlineUsers.has(me.id),
-            },
-          ]
+          {
+            user_id: me.id,
+            role: workspace?.owner_id === me.id ? "admin" : "member",
+            profile: me,
+            is_online: onlineUsers.has(me.id),
+          },
+        ]
         : []),
       ...members,
     ];
@@ -3485,9 +3596,9 @@ function WorkspacePage() {
       parent_message_id: replyingTo?.id ?? null,
       parent_snapshot: replyingTo
         ? {
-            sendername: replyingTo.sender?.full_name ?? 'Unknown',
-            content: replyingTo.content ?? '',
-          }
+          sendername: replyingTo.sender?.full_name ?? 'Unknown',
+          content: replyingTo.content ?? '',
+        }
         : null,
       sender: me,
     };
@@ -3515,9 +3626,9 @@ function WorkspacePage() {
         parent_message_id: replyingTo?.id ?? null,
         parent_snapshot: replyingTo
           ? {
-              sendername: replyingTo.sender?.full_name ?? 'Unknown',
-              content: replyingTo.content ?? '',
-            }
+            sendername: replyingTo.sender?.full_name ?? 'Unknown',
+            content: replyingTo.content ?? '',
+          }
           : null,
       };
 
@@ -6773,7 +6884,7 @@ function WorkspacePage() {
                     fontSize: "0.88rem",
                   }}
                 >
-                  You do not have access to send messages in this private channel.
+                  .
                 </div>
               )}
             </>
