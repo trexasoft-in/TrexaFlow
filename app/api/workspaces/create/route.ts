@@ -19,12 +19,11 @@ export async function POST(req: NextRequest) {
 
   const workspaceCode = Math.random().toString(36).substring(2, 10).toUpperCase();
 
-  let workspace;
-  let wsError;
+  let workspace: any = null;
+  let wsError: any = null;
 
-  // Try standard owner_id first
   const { data: ws1, error: err1 } = await supabaseAdmin
-    .from('workspaces')
+    .from("workspaces")
     .insert({
       name: workspaceName,
       description,
@@ -35,13 +34,22 @@ export async function POST(req: NextRequest) {
     .select()
     .single();
 
-  // Insert owner as admin member
+  workspace = ws1;
+  wsError = err1;
+
+  if (wsError || !workspace) {
+    return NextResponse.json(
+      { error: wsError?.message || "Failed to create workspace." },
+      { status: 500 }
+    );
+  }
+
   const { error: memberError } = await supabaseAdmin
-    .from('workspace_members')
+    .from("workspace_members")
     .insert({
       workspace_id: workspace.id,
       user_id: centralUser.userid,
-      role: 'admin',
+      role: "admin",
     });
 
   if (memberError) {
