@@ -562,14 +562,21 @@ function WorkspacePage() {
 
   useEffect(() => {
     if (!activeTask) return;
-    const fresh = projectTasks.find(t => t.id === activeTask.id);
+
+    const fresh = projectTasks.find((t) => t.id === activeTask.id);
+
+    // While tasks are reloading, do not clear the panel yet
     if (!fresh) {
+      if (loadingTasks) return;
+
+      // If reload finished and task truly no longer exists, then close it
       setActiveTask(null);
       setShowTaskPanel(false);
       return;
     }
-    setActiveTask(prev => (prev ? { ...prev, ...fresh } : fresh));
-  }, [projectTasks, activeTask?.id]);
+
+    setActiveTask((prev) => (prev ? { ...prev, ...fresh } : fresh));
+  }, [projectTasks, activeTask?.id, loadingTasks]);
 
   const loadTaskDetails = async (taskId: string) => {
     const [{ data: comments }, { data: subtasks }] = await Promise.all([
@@ -770,6 +777,7 @@ function WorkspacePage() {
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isCreatingProjectRef = useRef(false);
   const isCreatingChannelRef = useRef(false);
+  const lastOpenedTaskIdRef = useRef<Record<string, string>>({});
 
   // ── Reply state ──
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
@@ -786,6 +794,8 @@ function WorkspacePage() {
   useEffect(() => {
     if (me) loadProjectUnreadCounts();
   }, [me?.id]);
+
+
 
 
   // ─── useEffects ──────────────────────────────────────────
@@ -1309,6 +1319,11 @@ function WorkspacePage() {
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'project_messages' },
         async (payload: any) => {
           const msg = payload.new as any;
+
+          // If this project is currently open, the per-project subscription
+          // (subscribeToProjectMessages) already handles it — skip entirely here
+          if (activeProjectRef.current?.id === msg.project_id) return;
+
           // Only badge if NOT currently viewing this project's chat
           const isViewingThisProjectChat =
             viewRef.current === 'project' &&
@@ -1316,10 +1331,7 @@ function WorkspacePage() {
             projectTabRef.current === 'chat';
 
           if (!isViewingThisProjectChat && msg.sender_id !== meIdRef.current) {
-            setProjectChatUnread(prev => ({
-              ...prev,
-              [msg.project_id]: (prev[msg.project_id] ?? 0) + 1,
-            }));
+            refreshSingleProjectUnread(msg.project_id);
           }
         }
       )
@@ -1417,6 +1429,11 @@ function WorkspacePage() {
     await loadProjectMembers(project.id);
     await loadProjectMessages(project.id);
     await loadProjectTasks(project.id);
+
+    // Reset task panel on every project open — don't auto-reopen last task
+    setActiveTask(null);
+    setShowTaskPanel(false);
+
     subscribeToProjectTasks(project.id);
     subscribeToProjectMessages(project.id);
   };
@@ -1664,10 +1681,7 @@ function WorkspacePage() {
             projectTabRef.current === 'chat';
 
           if (!isViewingThisProjectChat && msg.sender_id !== me?.id) {
-            setProjectChatUnread(prev => ({
-              ...prev,
-              [projectId]: (prev[projectId] ?? 0) + 1,
-            }));
+            refreshSingleProjectUnread(projectId);
           }
         }
       )
@@ -1985,17 +1999,42 @@ function WorkspacePage() {
     }
   };
 
+  const refreshSingleProjectUnread = async (projectId: string) => {
+    const uid = meIdRef.current ?? me?.id;
+    if (!uid || !projectId) return;
+
+    try {
+      const count = await getProjectUnreadCount(projectId, uid);
+      setProjectChatUnread((prev) => ({
+        ...prev,
+        [projectId]: count,
+      }));
+    } catch (err) {
+      console.error("refreshSingleProjectUnread error", projectId, err);
+    }
+  };
+
 
   // Load tasks for a project
   const loadProjectTasks = async (projectId: string) => {
     setLoadingTasks(true);
-    const { data } = await supabase
-      .from('tasks')
-      .select('*, assignee:users(id, full_name, avatar_url, job_title)')
-      .eq('project_id', projectId)
-      .order('created_at', { ascending: false });
-    setProjectTasks((data as ProjectTask[]) ?? []);
+    const { data, error } = await supabase
+      .from("tasks")
+      .select("*, assignee:users!tasks_assignee_id_fkey(id, full_name, avatar_url, job_title)")
+      .eq("project_id", projectId)
+      .order("created_at", { ascending: false });
+
+    if (error) {
+      console.error("loadProjectTasks error", error);
+      setProjectTasks([]);
+      setLoadingTasks(false);
+      return [];
+    }
+
+    const tasks = (data as ProjectTask[]) ?? [];
+    setProjectTasks(tasks);
     setLoadingTasks(false);
+    return tasks;
   };
 
   // Subscribe to realtime task changes
@@ -2193,26 +2232,28 @@ function WorkspacePage() {
     const isAssignee = task.assignee_id === me.id;
     const isCreator = task.created_by === me.id;
     const canAdminTask = canManageProject;
+    const needsReviewFlow = ["task", "milestone"].includes(task.type) && !!task.assignee_id;
 
     const allowed =
       task.type === "task"
-        ? (
-          (newStatus === "complete" && (isAssignee || isCreator || canAdminTask)) ||
-          (["open", "active"].includes(newStatus) && (isCreator || canAdminTask))
-        )
-        : (
-          task.type === "milestone" &&
-          newStatus === "complete" &&
-          canAdminTask
-        );
+        ? newStatus === "complete"
+          ? (needsReviewFlow ? canAdminTask : (isAssignee || isCreator || canAdminTask))
+          : ["open", "active"].includes(newStatus)
+            ? (isAssignee || isCreator || canAdminTask)
+            : canAdminTask
+        : task.type === "milestone"
+          ? newStatus === "complete"
+            ? canAdminTask
+            : canAdminTask
+          : false;
 
     if (!allowed) {
       showToast("You do not have permission to change this task status.", "error");
       return;
     }
 
-    if (task.type === 'milestone' && newStatus === 'complete' && task.status !== 'in_review') {
-      showToast('Milestone must be submitted and reviewed before marking complete.', 'error');
+    if (newStatus === "complete" && needsReviewFlow && task.status !== "in_review") {
+      showToast("This item must be submitted and reviewed before marking complete.", "error");
       return;
     }
 
@@ -2248,18 +2289,18 @@ function WorkspacePage() {
   const submitMilestoneWork = async () => {
     if (!activeTask || !activeProject || !me) return;
 
-    if (activeTask.type !== "milestone") {
-      showToast("Only milestones can be submitted for review.", "error");
+    if (!["task", "milestone"].includes(activeTask.type)) {
+      showToast("This work item cannot be submitted for review.", "error");
       return;
     }
 
     if (activeTask.assignee_id !== me.id) {
-      showToast("Only the assigned member can submit this milestone.", "error");
+      showToast("Only the assigned member can submit this work.", "error");
       return;
     }
 
-    if (!["open", "active", "changesrequested"].includes(activeTask.status)) {
-      showToast("This milestone is not in a submittable state.", "error");
+    if (!["open", "active", "changes_requested"].includes(activeTask.status)) {
+      showToast("This item is not in a submittable state.", "error");
       return;
     }
 
@@ -2291,7 +2332,7 @@ function WorkspacePage() {
     const { error } = await supabase.from("tasks").update(updates).eq("id", activeTask.id);
 
     if (error) {
-      showToast("Failed to submit milestone work.", "error");
+      showToast("Failed to submit work.", "error");
       setSubmittingTask(false);
       return;
     }
@@ -2318,13 +2359,13 @@ function WorkspacePage() {
   const requestTaskRevision = async () => {
     if (!activeTask || !activeProject || !revisionNote.trim()) return;
 
-    if (activeTask.type !== "milestone" || !canManageProject) {
+    if (!["task", "milestone"].includes(activeTask.type) || !canManageProject) {
       showToast("You do not have permission to request changes.", "error");
       return;
     }
 
     if (activeTask.status !== "in_review") {
-      showToast("Changes can only be requested while the milestone is in review.", "error");
+      showToast("Changes can only be requested while the item is in review.", "error");
       return;
     }
 
@@ -3280,11 +3321,11 @@ function WorkspacePage() {
     (canManageProject || activeTask.created_by === me.id || activeTask.assignee_id === me.id);
   const canDeleteTask = !!activeTask && !!me && canManageProject;
   const canReviewMilestone =
-    !!activeTask && !!me && activeTask.type === "milestone" && canManageProject;
+    !!activeTask && !!me && ["task", "milestone"].includes(activeTask.type) && canManageProject;
   const canSubmitMilestone =
     !!activeTask &&
     !!me &&
-    activeTask.type === "milestone" &&
+    ["task", "milestone"].includes(activeTask.type) &&
     activeTask.assignee_id === me.id;
 
   const canAccessActiveProjectChat =
@@ -7693,6 +7734,9 @@ function WorkspacePage() {
                             onClick={() => {
                               setActiveTask(task);
                               setShowTaskPanel(true);
+                              if (activeProject?.id) {
+                                lastOpenedTaskIdRef.current[activeProject.id] = task.id;
+                              }
                               setEditingDescription(false);
                               setDescriptionDraft('');
                             }}
@@ -7892,6 +7936,9 @@ function WorkspacePage() {
                                     if (target) {
                                       setActiveTask(target);
                                       setShowTaskPanel(true);
+                                      if (activeProject?.id) {
+                                        lastOpenedTaskIdRef.current[activeProject.id] = target.id;
+                                      }
                                     }
                                   }}
                                   style={{
