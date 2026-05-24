@@ -43,34 +43,27 @@ type Channel = {
   description: string | null;
   is_private: boolean;
   is_default: boolean;
+  workspace_id?: string | null;
+  created_by?: string | null;
+  created_at?: string | null;
 };
 type Message = {
   id: string;
+  workspace_id: string;
   channel_id: string;
-  content: string;
-  created_at: string;
   sender_id: string;
+  content: string;
   is_pinned: boolean;
+  created_at: string;
   is_system?: boolean;
-  sender?: Profile;
   attachment_url?: string | null;
   attachment_name?: string | null;
   attachment_type?: string | null;
   parent_message_id?: string | null;
-  parent_snapshot?: { sendername: string; content: string } | null;
-  event_meta?: {
-    eventtype: 'taskassigned' | 'tasksubmitted' | 'taskchangesrequested' | 'taskcompleted';
-    taskid: string;
-    tasktitle: string;
-    tasktype: 'task' | 'milestone';
-    taskdescription?: string | null;
-    assignedtoname?: string;
-    assignedbyname?: string;
-    note?: string;
-    submissionurl?: string | null;
-    submissionfilename?: string | null;
-  } | null;
+  parent_snapshot?: any;
   project_id?: string | null;
+  event_meta?: any;
+  sender?: Profile | undefined;
 };
 type Member = {
   user_id: string;
@@ -760,6 +753,7 @@ function WorkspacePage() {
   const dmMenuRef = useRef<HTMLDivElement | null>(null);
   const dmSubRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const allDmSubRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
+  const activeChannelSubRef = useRef<ReturnType<typeof supabase.channel> | null>(null);
   const meIdRef = useRef<string | null>(null);
   const channelsRef = useRef<Channel[]>([]);
 
@@ -1048,6 +1042,126 @@ function WorkspacePage() {
       dmSubRef.current = null;
     };
   }, [me?.id, activeDmUserId]);
+
+  // Subscribe to realtime channel updates for active conversation
+  useEffect(() => {
+    if (!me?.id || !activeChannel?.id || view !== "channel") return;
+
+    const channelId = activeChannel.id;
+    const myId = me.id;
+
+    if (activeChannelSubRef.current) {
+      supabase.removeChannel(activeChannelSubRef.current);
+      activeChannelSubRef.current = null;
+    }
+
+    const sub = supabase
+      .channel(`active-channel-${workspaceId}-${channelId}-${myId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+          filter: `workspace_id=eq.${workspaceId}`,
+        },
+        async (payload) => {
+          const msg = payload.new as Message;
+
+          // Only handle messages for the currently open channel
+          if (msg.channel_id !== channelId) return;
+          // Skip own messages — handled optimistically in sendMessage
+          if (msg.sender_id === myId) return;
+
+          let sender: Profile | undefined = undefined;
+          const { data: senderData, error: senderErr } = await supabase
+            .from("users")
+            .select("id, full_name, email, job_title, avatar_url")
+            .eq("id", msg.sender_id)
+            .maybeSingle();
+
+          if (senderErr) {
+            console.error("active channel sender fetch failed:", senderErr);
+          }
+          if (senderData) sender = senderData as Profile;
+
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === msg.id)) return prev;
+            return [...prev, { ...msg, sender }];
+          });
+
+          setChannelLastMsg((prev) => ({
+            ...prev,
+            [msg.channel_id]: {
+              senderName: sender?.full_name?.split(" ")[0] ?? "Someone",
+              text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
+            },
+          }));
+
+          setUnreadCounts((prev) => ({ ...prev, [msg.channel_id]: 0 }));
+          setMentionCounts((prev) => ({ ...prev, [msg.channel_id]: 0 }));
+
+          setTimeout(() => {
+            if (messagesContainerRef.current) {
+              messagesContainerRef.current.scrollTop =
+                messagesContainerRef.current.scrollHeight;
+            }
+          }, 30);
+
+          if (me?.id) markChannelRead(msg.channel_id, me.id);
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "messages",
+          filter: `workspace_id=eq.${workspaceId}`,
+        },
+        (payload) => {
+          const msg = payload.new as Message;
+          if (msg.channel_id !== channelId) return;
+
+          setMessages((prev) =>
+            prev.map((m) => (m.id === msg.id ? { ...m, ...msg } : m))
+          );
+
+          setChannelLastMsg((prev) => ({
+            ...prev,
+            [msg.channel_id]: {
+              senderName: prev[msg.channel_id]?.senderName ?? "Someone",
+              text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
+            },
+          }));
+        }
+      )
+      .on(
+        "postgres_changes",
+        {
+          event: "DELETE",
+          schema: "public",
+          table: "messages",
+          filter: `workspace_id=eq.${workspaceId}`,
+        },
+        (payload) => {
+          const oldMsg = payload.old as Message;
+          if (oldMsg.channel_id !== channelId) return;
+          setMessages((prev) => prev.filter((m) => m.id !== oldMsg.id));
+        }
+      )
+      .subscribe();
+
+    activeChannelSubRef.current = sub;
+
+    return () => {
+      if (activeChannelSubRef.current) {
+        supabase.removeChannel(activeChannelSubRef.current);
+        activeChannelSubRef.current = null;
+      }
+    };
+  }, [workspaceId, activeChannel?.id, me?.id, view]);
+
   // Refresh only the channels list
   const refreshChannels = async () => {
     if (!me || refreshingChannels) return;
@@ -2605,7 +2719,6 @@ function WorkspacePage() {
         })
         .subscribe();
 
-      // ── Realtime: channel messages (per-user, workspace-scoped) ──
       const msgSub = supabase
         .channel(`channel-messages-${workspaceId}-${currentUserId}`)
         .on(
@@ -2614,76 +2727,48 @@ function WorkspacePage() {
             event: "INSERT",
             schema: "public",
             table: "messages",
+            filter: `workspace_id=eq.${workspaceId}`,
           },
           async (payload) => {
-            const msg = payload.new as Message;
+            const msg = payload.new as Message
 
-            // Ignore messages from other workspaces (safety, if table is multi-workspace)
-            if ((msg as any).workspace_id && (msg as any).workspace_id !== workspaceId) return;
+            if (msg.sender_id === currentUserId) return
 
-            // Skip own messages – handled optimistically in sendMessage
-            if (msg.sender_id === currentUserId) return;
+            const isOpenNow =
+              viewRef.current === "channel" &&
+              activeChannelRef.current?.id === msg.channel_id
 
-            // If channel is private, ensure this user is a member before showing anything
-            const channel = channelsRef.current.find((ch) => ch.id === msg.channel_id);
-            if (channel?.is_private) {
-              const { data: membership } = await supabase
-                .from("channel_members")
-                .select("channel_id")
-                .eq("channel_id", msg.channel_id)
-                .eq("user_id", currentUserId)
-                .maybeSingle();
-
-              if (!membership) return; // user has no access to this channel
-            }
-
-            // Fetch minimal sender info for sidebar + bubble avatar
+            let sender: Profile | undefined = undefined
             const { data: senderData } = await supabase
               .from("users")
-              .select("id, full_name, avatar_url")
+              .select("id, full_name, avatar_url, email, job_title")
               .eq("id", msg.sender_id)
-              .single();
-            const sender = (senderData ?? undefined) as Profile | undefined;
+              .maybeSingle()
 
-            // Sidebar last-message preview
+            if (senderData) sender = senderData as Profile
+
             setChannelLastMsg((prev) => ({
               ...prev,
               [msg.channel_id]: {
                 senderName: sender?.full_name?.split(" ")[0] ?? "Someone",
                 text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
               },
-            }));
+            }))
 
-            const isViewingThisChannel =
-              viewRef.current === "channel" &&
-              activeChannelRef.current?.id === msg.channel_id;
+            if (isOpenNow) {
+              return
+            }
 
-            if (isViewingThisChannel) {
-              // Append live to currently open channel
-              setMessages((prev) => {
-                if (prev.find((m) => m.id === msg.id)) return prev;
-                return [...prev, { ...msg, sender }];
-              });
+            setUnreadCounts((prev) => ({
+              ...prev,
+              [msg.channel_id]: (prev[msg.channel_id] ?? 0) + 1,
+            }))
 
-              requestAnimationFrame(() => {
-                const container = document.getElementById("channel-messages-container");
-                if (container) container.scrollTop = container.scrollHeight;
-              });
-
-              // Mark as read for this user
-              markChannelRead(msg.channel_id, currentUserId);
-            } else {
-              // User is elsewhere – increment unread + mention badge
-              setUnreadCounts((prev) => ({
+            if (messageHasMentionForMe(msg)) {
+              setMentionCounts((prev) => ({
                 ...prev,
-                [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
-              }));
-              if (messageHasMentionForMe(msg)) {
-                setMentionCounts((prev) => ({
-                  ...prev,
-                  [msg.channel_id]: (prev[msg.channel_id] || 0) + 1,
-                }));
-              }
+                [msg.channel_id]: (prev[msg.channel_id] ?? 0) + 1,
+              }))
             }
           }
         )
@@ -2693,23 +2778,24 @@ function WorkspacePage() {
             event: "UPDATE",
             schema: "public",
             table: "messages",
+            filter: `workspace_id=eq.${workspaceId}`,
           },
-          (payload) => {
-            const msg = payload.new as Message;
-            if (activeChannelRef.current?.id !== msg.channel_id) return;
+          async (payload) => {
+            const msg = payload.new as Message
 
-            setMessages((prev) =>
-              prev.map((m) => (m.id === msg.id ? { ...m, ...msg } : m))
-            );
-
-            // Keep last-message preview up to date on edits
             setChannelLastMsg((prev) => ({
               ...prev,
               [msg.channel_id]: {
                 senderName: prev[msg.channel_id]?.senderName ?? "Someone",
                 text: stripHtmlForPreview(msg.content ?? "").slice(0, 50),
               },
-            }));
+            }))
+
+            if (activeChannelRef.current?.id !== msg.channel_id) return
+
+            setMessages((prev) =>
+              prev.map((m) => (m.id === msg.id ? { ...m, ...msg } : m))
+            )
           }
         )
         .on(
@@ -2718,14 +2804,19 @@ function WorkspacePage() {
             event: "DELETE",
             schema: "public",
             table: "messages",
+            filter: `workspace_id=eq.${workspaceId}`,
           },
           (payload) => {
-            const deleted = payload.old as any;
-            if (activeChannelRef.current?.id !== deleted.channel_id) return;
-            setMessages((prev) => prev.filter((m) => m.id !== deleted.id));
+            const deleted = payload.old as Message
+
+            if (activeChannelRef.current?.id === deleted.channel_id) {
+              setMessages((prev) => prev.filter((m) => m.id !== deleted.id))
+            }
           }
         )
-        .subscribe();
+        .subscribe((status) => {
+          console.log("channel messages realtime status:", status)
+        });
 
       // ── Realtime: watch ALL incoming DMs for sidebar badge ──
       if (allDmSubRef.current) {
@@ -2848,7 +2939,11 @@ function WorkspacePage() {
   const loadChannelMessages = async (channelId: string) => {
     if (!me) return;
 
-    if (activeChannel?.is_private) {
+    const targetChannel =
+      channelsRef.current.find((c) => c.id === channelId) ??
+      (activeChannel?.id === channelId ? activeChannel : null);
+
+    if (targetChannel?.is_private) {
       const { data: membership } = await supabase
         .from("channel_members")
         .select("channel_id")
@@ -3095,12 +3190,17 @@ function WorkspacePage() {
   const canDeleteProjectMessage = (msg: ProjectMessage) =>
     !!me && !msg.is_system && (msg.sender_id === me.id || canManageProject);
 
-  const myChannelMembership = channelMembers.find((m) => m.user_id === me?.id);
+  const myChannelMembership = channelMembers.find((m: any) => m.user_id === me?.id);
 
   const canAccessActiveChannel =
     !!activeChannel &&
     !!me &&
-    (!activeChannel.is_private || !!myChannelMembership || activeChannel.is_default);
+    (
+      activeChannel.is_default ||
+      !activeChannel.is_private ||
+      !!myChannelMembership ||
+      activeChannel.created_by === me.id
+    );
 
   const canPinChannelMessage = (_msg: Message) => !!me && isWorkspaceAdmin;
 
@@ -3230,72 +3330,211 @@ function WorkspacePage() {
   const loadChannelMembers = async () => {
     if (!activeChannel) return;
 
-    const { data: cms } = await supabase
+    const { data: cms, error: cmError } = await supabase
       .from("channel_members")
       .select("user_id")
       .eq("channel_id", activeChannel.id);
 
-    const memberIds = cms?.map((m: any) => m.user_id) || [];
+    if (cmError) {
+      console.error("loadChannelMembers channel_members error:", cmError);
+      setChannelMembers([]);
+      setNonChannelMembers([]);
+      return;
+    }
 
-    const inChannel = members.filter(m => memberIds.includes(m.user_id));
-    const notInChannel = members.filter(m => !memberIds.includes(m.user_id));
+    const memberIds = (cms ?? []).map((m: any) => m.user_id);
 
-    setChannelMembers(inChannel);
-    setNonChannelMembers(notInChannel);
+    if (memberIds.length === 0) {
+      setChannelMembers([]);
+      setNonChannelMembers(
+        me
+          ? [
+              {
+                user_id: me.id,
+                role: workspace?.owner_id === me.id ? "admin" : "member",
+                profile: me,
+                is_online: onlineUsers.has(me.id),
+              } as any,
+              ...members,
+            ]
+          : members
+      );
+      return;
+    }
 
+    const { data: profiles, error: profilesError } = await supabase
+      .from("users")
+      .select("id, email, full_name, job_title, avatar_url")
+      .in("id", memberIds);
 
+    if (profilesError) {
+      console.error("loadChannelMembers users error:", profilesError);
+      setChannelMembers([]);
+      setNonChannelMembers([]);
+      return;
+    }
+
+    const profileMap = new Map((profiles ?? []).map((p: any) => [p.id, p]));
+
+    const workspaceMemberMap = new Map(
+      [
+        ...(me
+          ? [
+              {
+                user_id: me.id,
+                role: workspace?.owner_id === me.id ? "admin" : "member",
+                profile: me,
+                is_online: onlineUsers.has(me.id),
+              },
+            ]
+          : []),
+        ...members,
+      ].map((m: any) => [m.user_id, m])
+    );
+
+    const inChannel = memberIds
+      .map((userId: string) => {
+        const existing = workspaceMemberMap.get(userId);
+        return {
+          user_id: userId,
+          role: existing?.role ?? "member",
+          profile:
+            existing?.profile ??
+            profileMap.get(userId) ??
+            null,
+          is_online: onlineUsers.has(userId),
+        };
+      })
+      .filter((m) => m.profile);
+
+    const allWorkspacePeople = [
+      ...(me
+        ? [
+            {
+              user_id: me.id,
+              role: workspace?.owner_id === me.id ? "admin" : "member",
+              profile: me,
+              is_online: onlineUsers.has(me.id),
+            },
+          ]
+        : []),
+      ...members,
+    ];
+
+    const notInChannel = allWorkspacePeople.filter(
+      (m: any) => !memberIds.includes(m.user_id)
+    );
+
+    setChannelMembers(inChannel as any);
+    setNonChannelMembers(notInChannel as any);
   };
   // ─── Send channel message ─────────────────────────────────
   const sendMessage = async () => {
-    if (!activeChannel || !me || sending) return;
-
     const editorEl = editorRef.current;
-    const html = editorEl?.innerHTML ?? newMessage;
-    const content = sanitizeHtml(html);
+    if (!editorEl || !activeChannel || !me || sending || uploading) return;
 
-    if (!content.trim()) return;
+    const html = editorEl.innerHTML;
+    const content = sanitizeHtml(html).trim();
 
+    if (!content && !attachmentFile) return;
+
+    editorEl.innerHTML = "";
+    setNewMessage("");
+    newMessageRef.current = "";
+    setIsNewMessageEmpty(true);
     setSending(true);
+
+    let attachData: { url: string; name: string; type: 'image' | 'file' } | null = null;
+
+    if (attachmentFile && attachmentBytes) {
+      setUploading(true);
+      attachData = await uploadToCloudinary(attachmentFile, attachmentBytes, showToast);
+      setUploading(false);
+
+      if (!attachData) {
+        editorEl.innerHTML = html;
+        setNewMessage(html);
+        newMessageRef.current = html;
+        setIsNewMessageEmpty(false);
+        setSending(false);
+        setAttachmentFile(null);
+        setAttachmentBytes(null);
+        setAttachmentPreview(null);
+        return;
+      }
+
+      setAttachmentFile(null);
+      setAttachmentBytes(null);
+      setAttachmentPreview(null);
+    }
 
     const optimisticId = `temp-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 
     const optimistic: Message = {
       id: optimisticId,
+      workspace_id: workspaceId,
       channel_id: activeChannel.id,
       sender_id: me.id,
-      content,
+      content: content || "",
       created_at: new Date().toISOString(),
       is_pinned: false,
       is_system: false,
+      attachment_url: attachData?.url ?? null,
+      attachment_name: attachData?.name ?? null,
+      attachment_type: attachData?.type ?? null,
+      parent_message_id: replyingTo?.id ?? null,
+      parent_snapshot: replyingTo
+        ? {
+            sendername: replyingTo.sender?.full_name ?? 'Unknown',
+            content: replyingTo.content ?? '',
+          }
+        : null,
       sender: me,
     };
 
-    if (editorEl) editorEl.innerHTML = "";
-    setNewMessage("");
-    newMessageRef.current = "";
-    setIsNewMessageEmpty(true);
-    setMessages((prev) => [...prev, optimistic]);
+    setMessages(prev => [...prev, optimistic]);
+
+    setTimeout(() => {
+      if (messagesContainerRef.current) {
+        messagesContainerRef.current.scrollTop =
+          messagesContainerRef.current.scrollHeight;
+      }
+    }, 50);
 
     try {
+      const insertPayload = {
+        workspace_id: workspaceId,
+        channel_id: activeChannel.id,
+        sender_id: me.id,
+        content: content || "",
+        is_pinned: false,
+        is_system: false,
+        attachment_url: attachData?.url ?? null,
+        attachment_name: attachData?.name ?? null,
+        attachment_type: attachData?.type ?? null,
+        parent_message_id: replyingTo?.id ?? null,
+        parent_snapshot: replyingTo
+          ? {
+              sendername: replyingTo.sender?.full_name ?? 'Unknown',
+              content: replyingTo.content ?? '',
+            }
+          : null,
+      };
+
       const { data, error } = await supabase
-        .from("messages")
-        .insert({
-          channel_id: activeChannel.id,
-          sender_id: me.id,
-          content,
-          is_pinned: false,
-        })
-        .select("*")
+        .from('messages')
+        .insert(insertPayload)
+        .select()
         .single();
 
       if (error) {
-        console.error("sendMessage error", error);
-        setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
-        if (editorEl) editorEl.innerHTML = html;
+        console.error('sendMessage error', error);
+        setMessages(prev => prev.filter(m => m.id !== optimisticId));
+        editorEl.innerHTML = html;
         setNewMessage(html);
         newMessageRef.current = html;
         setIsNewMessageEmpty(false);
-        showToast("Failed to send message.", "error");
+        showToast('Failed to send message.', 'error');
         setSending(false);
         return;
       }
@@ -3305,21 +3544,22 @@ function WorkspacePage() {
         sender: me,
       };
 
-      setMessages((prev) =>
-        prev.map((m) => (m.id === optimisticId ? insertedWithSender : m))
+      setMessages(prev =>
+        prev.map(m => (m.id === optimisticId ? insertedWithSender : m))
       );
+
       setReplyingTo(null);
     } catch (err) {
-      console.error("sendMessage unexpected error", err);
-      setMessages((prev) => prev.filter((m) => m.id !== optimisticId));
-      if (editorEl) editorEl.innerHTML = html;
+      console.error('sendMessage unexpected error', err);
+      setMessages(prev => prev.filter(m => m.id !== optimisticId));
+      editorEl.innerHTML = html;
       setNewMessage(html);
       newMessageRef.current = html;
       setIsNewMessageEmpty(false);
-      showToast("Failed to send message.", "error");
+      showToast('Failed to send message.', 'error');
+    } finally {
+      setSending(false);
     }
-
-    setSending(false);
   };
 
   // ─── Send DM ──────────────────────────────────────────────
@@ -3915,6 +4155,7 @@ function WorkspacePage() {
   const doCreateChannel = async (creatorId: string) => {
     setCreatingChannel(true);
     isCreatingChannelRef.current = true;
+
     const { data: chan, error } = await supabase
       .from("channels")
       .insert({
@@ -3929,47 +4170,71 @@ function WorkspacePage() {
       .single();
 
     if (error) {
+      console.error("createChannel error:", error);
+      setCreatingChannel(false);
+      isCreatingChannelRef.current = false;
+      showToast("Failed to create channel.", "error");
+      return;
+    }
+
+    if (!chan) {
       setCreatingChannel(false);
       isCreatingChannelRef.current = false;
       return;
     }
 
-    if (chan) {
-      if (!newChannelPrivate) {
-        // Public channel — auto-add ALL workspace members
-        const allMemberIds = members.map(m => m.user_id);
-        const inserts = allMemberIds.map(uid => ({
-          channel_id: chan.id,
-          user_id: uid,
-        }));
-        await supabase.from("channel_members").insert(inserts);
-      } else {
-        // Private channel — only add the creator
-        await supabase.from("channel_members").insert({
-          channel_id: chan.id,
-          user_id: creatorId,
-        });
+    if (newChannelPrivate) {
+      const { error: ownerJoinError } = await supabase
+        .from("channel_members")
+        .upsert(
+          [{ channel_id: chan.id, user_id: creatorId }],
+          { onConflict: "channel_id,user_id" }
+        );
+
+      if (ownerJoinError) {
+        console.error("private channel owner auto-join failed:", ownerJoinError);
       }
+    } else {
+      const { data: wsMembers, error: wsMembersError } = await supabase
+        .from("workspace_members")
+        .select("user_id")
+        .eq("workspace_id", workspaceId);
 
-      // System message
-      await supabase.from("messages").insert({
-        channel_id: chan.id,
-        sender_id: creatorId,
-        content: `${me?.full_name} created this channel.`,
-        is_pinned: false,
-        is_system: true,
-      });
+      if (wsMembersError) {
+        console.error("Failed to load workspace members for public channel:", wsMembersError);
+      } else {
+        const inserts = (wsMembers ?? []).map((m: any) => ({
+          channel_id: chan.id,
+          user_id: m.user_id,
+        }));
 
-      setChannels(prev => {
-        if (prev.find(c => c.id === chan.id)) return prev;
-        return [...prev, chan];
-      });
-      await switchChannel(chan);
+        if (inserts.length > 0) {
+          await supabase
+            .from("channel_members")
+            .upsert(inserts, { onConflict: "channel_id,user_id" });
+        }
+      }
     }
+
+    await supabase.from("messages").insert({
+      workspace_id: workspaceId,
+      channel_id: chan.id,
+      sender_id: creatorId,
+      content: `${me?.full_name ?? "Someone"} created this channel.`,
+      is_pinned: false,
+      is_system: true,
+    });
+
+    setChannels((prev) => (prev.some((c) => c.id === chan.id) ? prev : [...prev, chan]));
+    await switchChannel(chan);
+    await loadChannelMembers();
+
     setCreatingChannel(false);
     isCreatingChannelRef.current = false;
     setShowCreateChannel(false);
-    setNewChannelName(""); setNewChannelDesc(""); setNewChannelPrivate(false);
+    setNewChannelName("");
+    setNewChannelDesc("");
+    setNewChannelPrivate(false);
   };
 
   // ─── Create channel ───────────────────────────────────────
