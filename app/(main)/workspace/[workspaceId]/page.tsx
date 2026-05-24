@@ -2620,20 +2620,37 @@ function WorkspacePage() {
       }
 
       if (!handled) {
-        // Fallback or explicit URL passed
         if (urlDm) {
           await openDm(urlDm);
         } else if (urlProject) {
-          const { data: proj } = await supabase.from('projects').select('*').eq('id', urlProject).single();
-          if (proj) await openProject(proj);
+          const { data: proj } = await supabase
+            .from("projects")
+            .select("*")
+            .eq("id", urlProject)
+            .single();
+
+          if (proj) {
+            await openProject(proj);
+          } else {
+            await openLobbyFallback(chans);
+          }
         } else {
           const startChannel =
-            chans.find(c => c.id === urlChannel) ??
-            chans.find(c => c.is_default) ??
+            chans.find((c) => c.id === urlChannel) ??
+            chans.find((c) => c.is_default) ??
             chans[0];
 
-          if (startChannel) await switchChannel(startChannel);
+          if (startChannel) {
+            await switchChannel(startChannel);
+          } else {
+            await openLobbyFallback(chans);
+          }
         }
+      }
+
+      // Final safety guard: never leave the main pane blank on load/reload
+      if (!activeChannelRef.current && viewRef.current === "channel") {
+        await openLobbyFallback(chans);
       }
 
       setLoading(false);
@@ -2746,19 +2763,16 @@ function WorkspacePage() {
         }, (payload) => {
           const deletedId = payload.old?.id;
           if (!deletedId) return;
-          setChannels(prev => prev.filter(c => c.id !== deletedId));
-          // If user is currently viewing the deleted channel, bounce to lobby
-          setActiveChannel(prev => {
-            if (prev?.id === deletedId) {
-              return null;
+
+          setChannels((prev) => {
+            const updated = prev.filter((c) => c.id !== deletedId);
+
+            if (activeChannel?.id === deletedId) {
+              setTimeout(() => {
+                openLobbyFallback(updated);
+              }, 0);
             }
-            return prev;
-          });
-          setChannels(prev => {
-            const updated = prev.filter(c => c.id !== deletedId);
-            // Find lobby from the fresh list
-            const lobby = updated.find(c => c.is_default) ?? updated[0];
-            if (lobby && activeChannel?.id === deletedId) switchChannel(lobby);
+
             return updated;
           });
         })
@@ -3179,6 +3193,16 @@ function WorkspacePage() {
     }
 
     setLoadingEarlier(false);
+  };
+
+  const openLobbyFallback = async (channelList?: Channel[]) => {
+    const list = channelList ?? channelsRef.current ?? [];
+    if (!list.length) return;
+
+    const lobby = list.find((c) => c.is_default) ?? list[0];
+    if (!lobby) return;
+
+    await switchChannel(lobby);
   };
 
   // ─── Switch active channel ────────────────────────────────
@@ -4417,13 +4441,9 @@ function WorkspacePage() {
       .eq("channel_id", activeChannel.id)
       .eq("user_id", me.id);
 
-    // Remove from this user's sidebar only
-    setChannels(prev => prev.filter(c => c.id !== activeChannel.id));
+    setChannels((prev) => prev.filter((c) => c.id !== activeChannel.id));
     setShowChannelSettings(false);
-
-    // Silently switch to Lobby — no system message
-    const lobby = channels.find(c => c.is_default);
-    if (lobby) await switchChannel(lobby);
+    await openLobbyFallback(channels.filter((c) => c.id !== activeChannel.id));
   };
 
   // ─── Save channel settings ────────────────────────────────
